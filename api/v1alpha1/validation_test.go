@@ -6,6 +6,7 @@ package v1alpha1_test
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/yaml"
 
 	v1 "github.com/vivekdavara/canary/api/v1alpha1"
 	"github.com/vivekdavara/canary/internal/revision"
@@ -353,5 +355,29 @@ func TestStatusIsASubresource(t *testing.T) {
 	}
 	if r.Status.Phase != v1.PhaseHealthy {
 		t.Errorf("an update of the object set status.phase to %q; want Healthy kept", r.Status.Phase)
+	}
+}
+
+// Every sample in config/samples decodes with no unknown field (a typo would be dropped silently by a lenient
+// decoder, and pruned by the API server) and is accepted as written.
+func TestSamplesAreAccepted(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join("..", "..", "config", "samples", "*.yaml"))
+	if err != nil || len(paths) == 0 {
+		t.Fatalf("no samples found: %v", err)
+	}
+	for _, path := range paths {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var r v1.CanaryRollout
+			if err := yaml.UnmarshalStrict(data, &r); err != nil {
+				t.Fatalf("%s: %v", path, err)
+			}
+			if err := create(t, &r); err != nil {
+				t.Fatalf("%s refused: %v", path, err)
+			}
+		})
 	}
 }

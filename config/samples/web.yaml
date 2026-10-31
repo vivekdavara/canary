@@ -1,0 +1,36 @@
+# A rollout of a web application in ten pods: 10% of them on the new version, then 50%, then all of it, each step
+# checked against its error rate and p95 latency. The Service that sends it traffic is the application's own and
+# selects app: web, which the pods of both versions carry.
+apiVersion: rollouts.vivekdavara.github.io/v1alpha1
+kind: CanaryRollout
+metadata:
+  name: web
+spec:
+  replicas: 10
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/e2e-test-images/agnhost:2.53
+          args: ["netexec", "--http-port=8080"]
+          ports:
+            - containerPort: 8080
+  steps:
+    - weight: 10
+      pause: 2m
+    - weight: 50
+      pause: 5m
+  progressDeadlineSeconds: 300
+  analysis:
+    interval: 30s
+    failureLimit: 1
+    metrics:
+      - name: error-rate
+        query: sum(rate(http_requests_total{app="web",track="canary",code=~"5.."}[1m])) / sum(rate(http_requests_total{app="web",track="canary"}[1m]))
+        max: 0.01
+      - name: p95-latency-seconds
+        query: histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{app="web",track="canary"}[1m])))
+        max: 0.3
