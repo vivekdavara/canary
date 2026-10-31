@@ -1,0 +1,19 @@
+# Tools and build output (make tools installs controller-gen and setup-envtest here; envtest's binaries go in bin/k8s)
+/bin/
+*.test
+*.out
+/coverage*
+
+# Local environment
+.env
+.env.*
+kubeconfig*
+
+# Scratch worktrees and run output
+/.scratch/
+/run/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
