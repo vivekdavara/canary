@@ -235,6 +235,14 @@ func TestRulesRefuseRawInput(t *testing.T) {
 		{"max as a string", []string{"spec", "analysis", "metrics"}, []any{map[string]any{"name": "e", "query": "q", "max": "0.01"}}, "spec.analysis.metrics[0].max"},
 		{"min above max as integers", []string{"spec", "analysis", "metrics"}, []any{map[string]any{"name": "e", "query": "q", "min": int64(2), "max": int64(1)}}, "min must not be greater than max"},
 		{"no template", []string{"spec", "template"}, nil, "spec.template: Required value"},
+		// Review of day 1: containers was required only once template.spec was there.
+		{"a template without a pod spec", []string{"spec", "template"}, map[string]any{"metadata": map[string]any{"labels": map[string]any{"app": "web"}}}, "spec.template.spec is required"},
+		{"an empty template", []string{"spec", "template"}, map[string]any{}, "spec.template.spec is required"},
+		// An empty list, not a missing one (nil is pruned to absent and refused as Required), so minItems is the rule
+		// that refuses it.
+		{"an empty step list", []string{"spec", "steps"}, []any{}, "spec.steps: Invalid value: 0: spec.steps in body should have at least 1 items"},
+		{"an empty metric list", []string{"spec", "analysis", "metrics"}, []any{}, "spec.analysis.metrics: Invalid value: 0: spec.analysis.metrics in body should have at least 1 items"},
+		{"a metric name of 64", []string{"spec", "analysis", "metrics"}, []any{map[string]any{"name": strings.Repeat("a", 64), "query": "q", "max": 1.0}}, "spec.analysis.metrics[0].name: Too long"},
 		{"no replicas field", []string{"spec", "replicas"}, nil, "spec.replicas: Required value"},
 	}
 	for _, tc := range cases {
@@ -246,6 +254,26 @@ func TestRulesRefuseRawInput(t *testing.T) {
 				t.Fatal(err)
 			}
 			refused(t, create(t, u), tc.want)
+		})
+	}
+}
+
+// The label rule's guards: a template may have no labels, or no metadata at all.
+func TestRulesAcceptRawInput(t *testing.T) {
+	cases := []struct {
+		name string
+		path []string
+	}{
+		{"a template without labels", []string{"spec", "template", "metadata", "labels"}},
+		{"a template without metadata", []string{"spec", "template", "metadata"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			u := unstructuredValid(t)
+			unstructured.RemoveNestedField(u.Object, tc.path...)
+			if err := create(t, u); err != nil {
+				t.Fatalf("refused: %v", err)
+			}
 		})
 	}
 }

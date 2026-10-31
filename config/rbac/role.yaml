@@ -25,6 +25,4 @@ rules:
   resources:
   - canaryrollouts/status
   verbs:
-  - get
   - patch
-  - update

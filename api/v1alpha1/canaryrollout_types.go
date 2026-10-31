@@ -11,6 +11,7 @@ const LabelPrefix = "rollouts.vivekdavara.github.io/"
 // CanaryRolloutSpec is what the user asks for: a version to run, and how to move to it.
 //
 // +kubebuilder:validation:XValidation:rule="!has(self.template.metadata) || !has(self.template.metadata.labels) || self.template.metadata.labels.all(k, !k.startsWith('rollouts.vivekdavara.github.io/'))",message="template labels may not start with rollouts.vivekdavara.github.io/ (the operator sets those)"
+// +kubebuilder:validation:XValidation:rule="has(self.template.spec)",message="spec.template.spec is required"
 type CanaryRolloutSpec struct {
 	// Replicas is the number of pods in total, stable and canary together (during a step below 100% that leaves no
 	// stable pod, one more).

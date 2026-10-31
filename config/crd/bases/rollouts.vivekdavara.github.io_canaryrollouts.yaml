@@ -9022,6 +9022,8 @@ spec:
                 (the operator sets those)
               rule: '!has(self.template.metadata) || !has(self.template.metadata.labels)
                 || self.template.metadata.labels.all(k, !k.startsWith(''rollouts.vivekdavara.github.io/''))'
+            - message: spec.template.spec is required
+              rule: has(self.template.spec)
           status:
             description: CanaryRolloutStatus is what the operator observed and did.
               DESIGN.md, "Status", says which day fills each field.

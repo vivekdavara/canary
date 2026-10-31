@@ -20,11 +20,12 @@ type CanaryRolloutReconciler struct {
 	client.Client
 }
 
-// The permissions the operator needs, generated into config/rbac/role.yaml by make manifests. Watching Deployments
-// needs only reading them; day 2 adds writing them, and Events.
+// The permissions the operator needs, generated into config/rbac/role.yaml by make manifests: no more than the code
+// uses (the status is only patched). Watching Deployments needs only reading them; day 2 adds writing them, and
+// Events. --leader-elect's Lease is in config/rbac/leader_election_role.yaml, a namespaced Role.
 //
 // +kubebuilder:rbac:groups=rollouts.vivekdavara.github.io,resources=canaryrollouts,verbs=get;list;watch
-// +kubebuilder:rbac:groups=rollouts.vivekdavara.github.io,resources=canaryrollouts/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=rollouts.vivekdavara.github.io,resources=canaryrollouts/status,verbs=patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
 
 // Reconcile brings one rollout's status up to date with its spec.
