@@ -35,7 +35,7 @@ type Env struct {
 
 	te           *envtest.Environment
 	operatorOnce sync.Once
-	operatorCfg  *rest.Config
+	operator     *envtest.AuthenticatedUser
 	operatorErr  error
 }
 
@@ -95,14 +95,34 @@ func run(m *testing.M, te *envtest.Environment, cfg *rest.Config, scheme *krunti
 // as it would in a cluster. envtest's API server authorizes by RBAC; the administrator's Config bypasses it.
 func (e *Env) OperatorConfig(t testing.TB) *rest.Config {
 	t.Helper()
-	e.operatorOnce.Do(func() { e.operatorCfg, e.operatorErr = e.addOperator() })
+	return rest.CopyConfig(e.operatorUser(t).Config())
+}
+
+// OperatorKubeconfig writes a kubeconfig for the same user into the test's temporary directory and returns its path,
+// for running the operator's binary.
+func (e *Env) OperatorKubeconfig(t testing.TB) string {
+	t.Helper()
+	data, err := e.operatorUser(t).KubeConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "kubeconfig")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func (e *Env) operatorUser(t testing.TB) *envtest.AuthenticatedUser {
+	t.Helper()
+	e.operatorOnce.Do(func() { e.operator, e.operatorErr = e.addOperator() })
 	if e.operatorErr != nil {
 		t.Fatalf("setting up the operator's user: %v", e.operatorErr)
 	}
-	return rest.CopyConfig(e.operatorCfg)
+	return e.operator
 }
 
-func (e *Env) addOperator() (*rest.Config, error) {
+func (e *Env) addOperator() (*envtest.AuthenticatedUser, error) {
 	const user = "canary-operator"
 	data, err := os.ReadFile(filepath.Join(repoRoot(), "config", "rbac", "role.yaml"))
 	if err != nil {
@@ -124,11 +144,7 @@ func (e *Env) addOperator() (*rest.Config, error) {
 	if err := e.Client.Create(ctx, binding); err != nil {
 		return nil, err
 	}
-	u, err := e.te.AddUser(envtest.User{Name: user}, e.Config)
-	if err != nil {
-		return nil, err
-	}
-	return u.Config(), nil
+	return e.te.AddUser(envtest.User{Name: user}, e.Config)
 }
 
 // Get returns the package's Env, or skips the test when envtest isn't available.

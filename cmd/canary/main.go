@@ -3,6 +3,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -19,14 +21,22 @@ import (
 )
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	err := run(ctrl.SetupSignalHandler(), os.Args[1:])
+	switch {
+	case err == nil:
+	case errors.Is(err, flag.ErrHelp):
+		// -h or --help: the flag package has printed the usage.
+	default:
 		fmt.Fprintln(os.Stderr, "canary:", err)
 		os.Exit(1)
 	}
 }
 
-func run(args []string) error {
+// run runs the operator until ctx is done (SIGTERM or SIGINT, from main).
+func run(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("canary", flag.ContinueOnError)
+	// --kubeconfig; without it, $KUBECONFIG, then the in-cluster service account, then ~/.kube/config.
+	ctrl.RegisterFlags(fs)
 	// Ports from the portfolio's port map: metrics on 8111; the probes on 8121, which nothing else here uses.
 	metricsAddr := fs.String("metrics-bind-address", ":8111", "where the Prometheus metrics are served; 0 turns them off")
 	probeAddr := fs.String("health-probe-bind-address", ":8121", "where /healthz and /readyz are served")
@@ -66,7 +76,7 @@ func run(args []string) error {
 		return err
 	}
 	ctrl.Log.WithName("canary").Info("starting", "metrics", *metricsAddr, "probes", *probeAddr)
-	return mgr.Start(ctrl.SetupSignalHandler())
+	return mgr.Start(ctx)
 }
 
 // newScheme holds every type the manager reads or writes: the built-in ones (Deployments, Events) and CanaryRollout.
