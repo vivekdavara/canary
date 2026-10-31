@@ -67,6 +67,7 @@ The full example is [config/samples/web.yaml](config/samples/web.yaml) (a test a
 | `api/v1alpha1/` | the `CanaryRollout` types, their validation markers and CEL rules; `zz_generated.deepcopy.go` is generated |
 | `config/crd/bases/` | the CRD, generated from the types (`make manifests`) |
 | `config/rbac/role.yaml` | the operator's ClusterRole, generated from the reconciler's rbac markers |
+| `config/rbac/leader_election_role.yaml` | the Role for `--leader-elect`, in the Lease's namespace (written by hand) |
 | `config/samples/` | example rollouts |
 | `internal/revision/` | a template's revision: 16 hex digits of the SHA-256 of its JSON |
 | `internal/controller/` | the reconciler |
@@ -101,7 +102,9 @@ kubectl apply -f config/samples/web.yaml && kubectl get canaryrollouts
 The CRD needs `--server-side`: with the pod template's schema and descriptions it is 637,212 bytes, and a client-side
 apply would store all of it in an annotation limited to 256 KiB (DESIGN.md, "Why these choices"). On day 1 the
 operator only records the template's revision and the generation it saw (`kubectl get crl` shows the revision); it
-creates no Deployments yet. The operator serves metrics on `:8111` and `/healthz` and `/readyz` on `:8121`.
+creates no Deployments yet. The operator serves metrics on `:8111` and `/healthz` and `/readyz` on `:8121`. With
+`--leader-elect` (for more than one replica) it also needs `--leader-election-namespace` outside a cluster, and
+`config/rbac/leader_election_role.yaml` bound in that namespace (the Lease and its Events).
 
 ## Tests
 
@@ -112,11 +115,13 @@ All against envtest's real API server unless marked unit.
 | `api/v1alpha1/validation_test.go` | each CRD rule refuses with its message, each boundary value is accepted, raw input the typed struct can't express (`pause: 1d`, a quoted threshold, missing required fields), the defaults, template labels surviving pruning, defaults filled inside the pod template, status as a subresource, the samples |
 | `internal/revision/revision_test.go` (unit) | a pinned revision (checked against `shasum` of the JSON), a valid label value, every kind of change moves it, map order and quantity spelling don't |
 | `internal/controller/canaryrollout_controller_test.go` | status follows the spec through template and replica changes; the rest of the status is kept; a missing rollout is no error. The operator runs as a user holding only the generated ClusterRole |
-| `cmd/canary/main_test.go` | the binary from its flags and a kubeconfig: probes answer, a rollout is reconciled, the reconcile is counted in its metrics, a clean stop; `--help` |
+| `cmd/canary/main_test.go` | the binary from its flags and a kubeconfig: probes answer, a rollout is reconciled, the reconcile is counted in its metrics, a clean stop; with `--leader-elect` it takes the Lease using only the leader-election Role; `--help` |
+| `config/install_test.go` | the README's install steps with envtest's kubectl: client-side apply of the CRD fails ("Too long"), `--server-side` works, the sample applies, `kubectl get crl` shows the columns |
 
-Two checks that the tests can fail: removing the Deployments rule from `config/rbac/role.yaml` fails
-`TestStatusFollowsTheSpec` in 12 s (the operator's Deployment cache never syncs); misspelling `failureLimit` in the
-sample fails `TestSamplesAreAccepted` ("unknown field").
+Three checks that the tests can fail: removing the Deployments rule from `config/rbac/role.yaml` fails
+`TestStatusFollowsTheSpec` in 12 s (the operator's Deployment cache never syncs); removing the Lease rule from
+`leader_election_role.yaml` fails `TestRunElectsALeader` (it never leads, so nothing is reconciled in 15 s);
+misspelling `failureLimit` in the sample fails `TestSamplesAreAccepted` ("unknown field").
 
 ## Results (day 1)
 

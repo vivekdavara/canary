@@ -112,6 +112,12 @@ The tests run the operator as a user holding exactly `config/rbac/role.yaml`, wh
 reconciler's `+kubebuilder:rbac` markers (`testenv.OperatorConfig`). Removing the Deployments rule from it fails
 `TestStatusFollowsTheSpec` in 12 seconds: the Deployment informer can't list, so its cache never syncs.
 
+**And with more than one replica?**
+`--leader-elect` makes the replicas elect a leader through a Lease, and only the leader reconciles. The Lease lives in
+one namespace, so its permissions are a namespaced Role (`config/rbac/leader_election_role.yaml`), not part of the
+cluster-wide one. Day 1 first shipped the flag without either the Role or a way to name the namespace outside a
+cluster; `TestRunElectsALeader` now runs the binary with only that Role and checks it takes the Lease and reconciles.
+
 **How can CI not pass by skipping the envtest suites?**
 Without `KUBEBUILDER_ASSETS` a plain `go test ./...` skips them; `make test` sets `CANARY_REQUIRE_ENVTEST`, which makes
 `testenv.Main` fail the package instead. CI runs `make check`.
@@ -130,4 +136,5 @@ or a controller never set up in `main`; this one can.
   right, the expectations weren't.
 - A test run that "passed" in 0.4 s had skipped everything: the shell's `export KUBEBUILDER_ASSETS` doesn't carry
   over between tool calls. That's the case `CANARY_REQUIRE_ENVTEST` exists for.
+- `--leader-elect` was a flag with nothing behind it (above).
 - The public GitHub repository couldn't be created from the scheduled session, so CI hasn't run.
