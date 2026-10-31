@@ -14,8 +14,9 @@ import (
 const Length = 16
 
 // Of is the revision of a template: the first Length hex digits of the SHA-256 of its JSON encoding. encoding/json
-// writes struct fields in declaration order and map keys sorted, and quantities in canonical form, so equal templates
-// get equal revisions in every process.
+// writes struct fields in declaration order and map keys sorted, so a template gets the same revision in every
+// process. A quantity encodes canonically within its format (0.5 and 500m alike) but keeps the format, so 1Gi and
+// 1073741824, though equal, give different revisions.
 //
 // Hash the template as the API server stored it, not as a client sent it: the server fills defaults inside the pod
 // template (a port's protocol, for one), so the two can differ.

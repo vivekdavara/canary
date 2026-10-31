@@ -60,16 +60,18 @@ structural schema doesn't declare, so `spec.template.metadata.labels` would vani
 the labels the Service selects. With the option they're declared and kept (`TestDefaultsAndTemplateLabelsSurvive`).
 
 **Why must the CRD be applied with `--server-side`?**
-It is 637,212 bytes with the pod schema's descriptions. Client-side apply copies the whole object into the
+It is 636,521 bytes with the pod schema's descriptions. Client-side apply copies the whole object into the
 `kubectl.kubernetes.io/last-applied-configuration` annotation, and annotations are limited to 256 KiB. Server-side
-apply keeps no such copy. `crd:maxDescLen=0` would shrink it to 203,982 bytes but leave `kubectl explain` empty.
+apply keeps no such copy. `crd:maxDescLen=0` would shrink it to 203,435 bytes but leave `kubectl explain` empty.
 
 ## Revisions
 
 **How do you tell whether the template changed?**
 `internal/revision.Of`: the first 16 hex digits of the SHA-256 of the template's JSON. Go's encoder writes struct
-fields in a fixed order and map keys sorted, and quantities in canonical form, so equal templates hash equally
-(`TestEqualTemplatesGetEqualRevisions` shuffles 50 labels' insertion order 100 times). It goes on pods as a label, so
+fields in a fixed order and map keys sorted, so map order doesn't matter (`TestEqualTemplatesGetEqualRevisions`
+shuffles 50 labels' insertion order 100 times). Quantities are canonical only within a format: `0.5` and `500m` hash
+alike, `1Gi` and `1073741824` don't, so rewriting one in the other format starts a rollout (the review found my
+first comment claiming otherwise). It goes on pods as a label, so
 16 hex digits also fits the 63-character limit.
 
 **Which template do you hash, the one the user sent?**
@@ -127,6 +129,26 @@ Without `KUBEBUILDER_ASSETS` a plain `go test ./...` skips them; `make test` set
 answer, a rollout is reconciled, `controller_runtime_reconcile_total{controller="canaryrollout",result="success"}`
 appears on `/metrics`, and a cancel stops it cleanly. The controller tests can't see a missing scheme registration
 or a controller never set up in `main`; this one can.
+
+## The review (day 1)
+
+**What did the review find?**
+One agent, at `2694208`, 11 minutes, in its own worktree, findings as failing tests. Reproduced:
+
+- A template with no pod spec was accepted (`containers` was only required once `spec` existed): fixed with a CEL
+  rule, tested.
+- **A probe port over int32 is accepted, and then the operator can't decode the object**, and since a list decodes
+  as one document, one such rollout in any namespace stopped the operator from reconciling every other one. Not
+  fixed on day 1: the fix is in how the operator reads rollouts (each object decoded on its own), day 2's first job.
+- `--leader-elect` couldn't work with the generated role (I had found and fixed it meanwhile, `f89ec6e`).
+- Template label syntax isn't checked; the CEL rule for it is over budget (DESIGN.md, "What the API server does not
+  catch").
+- `weight: 10.0` from a raw-JSON client fails a rule with an evaluation error.
+- Equal quantities in different formats give different revisions (now documented and tested as the behaviour).
+
+It also listed six mechanisms the tests didn't notice removed; the four in the CRD (minItems on both lists, the
+metric name's maxLength, the label rule's guards) now have tests, each re-run as a mutant. The three in the
+reconciler (the optimistic lock, the no-change early return, the conflict branch) still have none.
 
 ## What went wrong on day 1
 

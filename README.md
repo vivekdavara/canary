@@ -99,7 +99,7 @@ go run ./cmd/canary --kubeconfig ~/.kube/config
 kubectl apply -f config/samples/web.yaml && kubectl get canaryrollouts
 ```
 
-The CRD needs `--server-side`: with the pod template's schema and descriptions it is 637,212 bytes, and a client-side
+The CRD needs `--server-side`: with the pod template's schema and descriptions it is 636,521 bytes, and a client-side
 apply would store all of it in an annotation limited to 256 KiB (DESIGN.md, "Why these choices"). On day 1 the
 operator only records the template's revision and the generation it saw (`kubectl get crl` shows the revision); it
 creates no Deployments yet. The operator serves metrics on `:8111` and `/healthz` and `/readyz` on `:8121`. With
@@ -127,11 +127,23 @@ misspelling `failureLimit` in the sample fails `TestSamplesAreAccepted` ("unknow
 
 Nothing runs a rollout yet, so there are no rollout numbers. What was measured:
 
-- The CRD is 637,212 bytes with descriptions and 203,982 without (`wc -c` on controller-gen's output with and
-  without `crd:maxDescLen=0`).
+- The CRD is 636,521 bytes with descriptions and 203,435 without (`wc -c` on controller-gen's output with and
+  without `crd:maxDescLen=0`, at `df03545`).
+- `make check` warm: 15.79 s (`/usr/bin/time -p make check` at `456174b`, on battery): 20 tests and 56 subtests,
+  none skipped.
 - The first version of the thresholds (`resource.Quantity`) made the API server refuse the CRD: the `min <= max` CEL
   rule's estimated cost was 1.258302 times its budget (envtest's error on starting). With `float64` thresholds the
   CRD installs.
+
+## Review of day 1
+
+One review agent at `2694208` (11 minutes, its own worktree, findings as failing tests) reproduced 6 defects. Fixed: a
+template with no pod spec was accepted; `--leader-elect` had no Lease permission (fixed meanwhile). Documented, not
+fixed: **a probe port over int32 is accepted and makes the object undecodable, and one such rollout stops the
+operator for all of them** (day 2's first job: decode each rollout on its own); template label syntax isn't checked
+(the CEL rule is over budget); `weight: 10.0` from a raw-JSON client fails with an evaluation error; equal quantities
+in different formats get different revisions. Four rules it could remove with every test passing now have tests;
+three reconciler mechanisms (the optimistic lock, the no-change return, the conflict branch) still don't.
 
 ## CI
 
@@ -150,6 +162,7 @@ nothing has been pushed (see the day's log).
 ## Limitations
 
 - Day 1: no Deployments are created and nothing is analysed yet.
+- One rollout with a probe port over int32 stops the operator for every rollout (the review's finding; day 2).
 - Replica ratio is a coarse split (connections, not requests; one pod of three is 33%).
 - `replicas` is at least 1; no HPA integration, no manual pause or approval.
 - A `k8s.io/api` upgrade that changes the template's encoding would change every revision; a pinned test catches it.

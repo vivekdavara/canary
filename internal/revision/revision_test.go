@@ -94,3 +94,19 @@ func TestEqualTemplatesGetEqualRevisions(t *testing.T) {
 		}
 	}
 }
+
+// A quantity's format is part of the revision (found by day 1's review): canonical within a format, so 0.5 and 500m
+// agree, but 1Gi and 1073741824, though equal, don't. Rewriting a quantity in another format starts a rollout.
+func TestQuantityFormatIsPartOfTheRevision(t *testing.T) {
+	memory := func(q string) string {
+		p := template("example.com/web:1")
+		p.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory] = resource.MustParse(q)
+		return Of(p)
+	}
+	if memory("1Gi") == memory("1073741824") {
+		t.Error("1Gi and 1073741824 have the same revision; the docs say they don't")
+	}
+	if memory("1500m") != memory("1.5") {
+		t.Error("1500m and 1.5 have different revisions; both are decimal SI and should agree")
+	}
+}

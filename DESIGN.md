@@ -84,8 +84,22 @@ spec:
 
 Every rule above is enforced by the API server, from the CRD's OpenAPI schema and its CEL rules
 (`x-kubernetes-validations`), so a bad rollout is refused at `kubectl apply` with a message, rather than accepted
-and then failing in the operator. Day 1's envtest tests check each rule against a real API server, refusals and
-acceptances both.
+and then failing in the operator; the template must also have a pod spec. Day 1's envtest tests check each rule
+against a real API server, refusals and acceptances both.
+
+What the API server does *not* catch inside the pod template (found by day 1's review; DESIGN's goal still stands
+for the fields above):
+
+- **Ports in probes and lifecycle hooks beyond int32.** They are int-or-string fields, and the CRD's copy of the
+  pod schema doesn't bound them, so `httpGet.port: 99999999999` is accepted and stored, and the operator's typed
+  client then can't decode that object. Worse, a list is decoded as one document, so one such rollout anywhere in
+  the cluster stops the operator from seeing any rollout (the review reproduced it). Day 2 fixes this in the
+  operator: it reads rollouts without decoding the whole list at once and reports an undecodable one on its own.
+- **Label syntax.** Template label keys and values aren't checked (the schema's labels are a plain string map). A
+  CEL rule using `format.qualifiedName()` and `format.labelValue()` is over the cost budget, because the map has no
+  size bound; day 2's operator checks them before building a Deployment.
+- **A weight written as `10.0`** (from a raw-JSON client; kubectl writes `10`) fails the increasing-weights rule
+  with an evaluation error rather than being accepted.
 
 Why these choices:
 
@@ -104,7 +118,7 @@ Why these choices:
   `crd:generateEmbeddedObjectMeta=true` keeps labels and annotations; a test reads them back.
 - **Steps are percentages of `replicas`**, not pod counts, so changing `replicas` doesn't need the steps rewritten.
 - **The CRD keeps its descriptions and is installed with server-side apply.** The full pod template schema with
-  descriptions makes the CRD 637,212 bytes (`wc -c config/crd/bases/*`; 203,982 with `crd:maxDescLen=0`). A
+  descriptions makes the CRD 636,521 bytes (`wc -c config/crd/bases/*`; 203,435 with `crd:maxDescLen=0`). A
   client-side `kubectl apply` copies the whole object into the `last-applied-configuration` annotation, and
   annotations are limited to 256 KiB, so it would fail; `kubectl apply --server-side` keeps no such copy. Stripping
   the descriptions would fit, but `kubectl explain canaryrollout.spec.steps` would then explain nothing.
@@ -126,8 +140,10 @@ Why these choices:
 | `conditions` | `Progressing`, `Available` (day 2), `AnalysisPassing` (day 3) |
 
 **The revision** of a template is the first 16 hex digits of the SHA-256 of its JSON encoding. Go's encoder writes
-struct fields in a fixed order and map keys sorted, and quantities in canonical form (`0.5` and `500m` encode the
-same), so equal templates get equal revisions in every process. It goes on the pods as a label, so 16 hex digits
+struct fields in a fixed order and map keys sorted, so the same template gets the same revision in every process.
+Quantities encode in a canonical form *within their format* (`0.5` and `500m` encode the same), but the format is
+kept: `1Gi` and `1073741824` are equal and get different revisions, so rewriting a quantity in another format starts
+a rollout of what is the same template (`TestQuantityFormatIsPartOfTheRevision`). It goes on the pods as a label, so 16 hex digits
 (64 bits) also keeps it well inside the 63-character limit for label values.
 
 ## The rollout (days 2 and 3)
