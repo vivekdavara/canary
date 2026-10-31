@@ -8,9 +8,11 @@ package testenv
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 
@@ -176,6 +178,20 @@ func (e *Env) addOperator() (*envtest.AuthenticatedUser, error) {
 		return nil, err
 	}
 	return e.te.AddUser(envtest.User{Name: operatorUser}, e.Config)
+}
+
+// Kubectl runs envtest's kubectl (setup-envtest downloads it with the API server, so their versions match) as the
+// administrator, and returns what it wrote.
+func (e *Env) Kubectl(args ...string) (stdout, stderr string, err error) {
+	out, errOut, err := e.te.ControlPlane.KubeCtl().Run(args...)
+	var o, eo strings.Builder
+	if out != nil {
+		_, _ = io.Copy(&o, out)
+	}
+	if errOut != nil {
+		_, _ = io.Copy(&eo, errOut)
+	}
+	return o.String(), eo.String(), err
 }
 
 // Get returns the package's Env, or skips the test when envtest isn't available.
