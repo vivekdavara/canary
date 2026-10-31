@@ -99,6 +99,11 @@ Why these choices:
   server then prunes the template's labels on write, so the pods would lose the labels the Service selects.
   `crd:generateEmbeddedObjectMeta=true` keeps labels and annotations; a test reads them back.
 - **Steps are percentages of `replicas`**, not pod counts, so changing `replicas` doesn't need the steps rewritten.
+- **The CRD keeps its descriptions and is installed with server-side apply.** The full pod template schema with
+  descriptions makes the CRD 637,212 bytes (`wc -c config/crd/bases/*`; 203,982 with `crd:maxDescLen=0`). A
+  client-side `kubectl apply` copies the whole object into the `last-applied-configuration` annotation, and
+  annotations are limited to 256 KiB, so it would fail; `kubectl apply --server-side` keeps no such copy. Stripping
+  the descriptions would fit, but `kubectl explain canaryrollout.spec.steps` would then explain nothing.
 
 ### Status
 

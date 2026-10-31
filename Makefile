@@ -1,4 +1,4 @@
-.PHONY: build check envtest lint test tools
+.PHONY: build check envtest generate lint manifests test tools
 
 # Tools, pinned and installed into bin/ (gitignored), so a check never depends on what else is on the machine.
 CONTROLLER_TOOLS_VERSION ?= v0.21.0
@@ -10,8 +10,18 @@ BIN := $(CURDIR)/bin
 CONTROLLER_GEN := $(BIN)/controller-gen-$(CONTROLLER_TOOLS_VERSION)
 SETUP_ENVTEST := $(BIN)/setup-envtest-$(SETUP_ENVTEST_VERSION)
 
-# What CI runs.
-check: lint test
+# What CI runs. generate and manifests rewrite the generated files first, so the tests always run against the CRD the
+# types describe; CI then fails if that changed anything (the generated files weren't committed).
+check: generate manifests lint test
+
+# The deep-copy methods every API type needs (api/v1alpha1/zz_generated.deepcopy.go).
+generate: $(CONTROLLER_GEN)
+	$(CONTROLLER_GEN) object paths=./api/...
+
+# The CRD from the types and their markers. generateEmbeddedObjectMeta keeps the schema of spec.template.metadata, which
+# controller-gen otherwise drops, so the API server would prune the template's labels (DESIGN.md, "Why these choices").
+manifests: $(CONTROLLER_GEN)
+	$(CONTROLLER_GEN) crd:generateEmbeddedObjectMeta=true paths=./api/... output:crd:artifacts:config=config/crd/bases
 
 tools: $(CONTROLLER_GEN) $(SETUP_ENVTEST)
 

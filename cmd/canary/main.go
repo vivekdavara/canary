@@ -13,6 +13,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
+	rolloutsv1alpha1 "github.com/vivekdavara/canary/api/v1alpha1"
 )
 
 func main() {
@@ -63,10 +65,13 @@ func run(args []string) error {
 	return mgr.Start(ctrl.SetupSignalHandler())
 }
 
-// newScheme holds every type the manager reads or writes: the built-in ones (Deployments, Events).
+// newScheme holds every type the manager reads or writes: the built-in ones (Deployments, Events) and CanaryRollout.
 func newScheme() (*runtime.Scheme, error) {
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		return nil, err
+	}
+	if err := rolloutsv1alpha1.AddToScheme(scheme); err != nil {
 		return nil, err
 	}
 	return scheme, nil
