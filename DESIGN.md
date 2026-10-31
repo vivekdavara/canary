@@ -205,6 +205,11 @@ failed since the step began.
   1.37.0, downloaded by `setup-envtest` into `bin/k8s`) with the CRD installed, but no controllers of Kubernetes'
   own: a Deployment never gets pods. The CRD's validation and the operator's writes are tested against it; tests
   that need ready pods set the Deployment's status themselves (days 2-3).
+- **The operator's permissions are the generated ones.** Tests run the operator as an envtest user holding only
+  `config/rbac/role.yaml` (and, with `--leader-elect`, `leader_election_role.yaml` in the Lease's namespace), never as
+  the administrator, so a permission the rbac markers miss fails a test.
+- **The manifests are applied with kubectl**, the version envtest downloads with the API server, as the README says
+  to (`config/install_test.go`).
 - **Unit tests** for the pure parts: revisions, the split, the state machine's decisions (day 2), the analysis's
   verdicts (day 3).
 - **kind** in CI on day 4: a real cluster with a real Deployment controller, one rollout that passes and one that
