@@ -70,6 +70,11 @@ func Main(m *testing.M) int {
 	cfg, err := te.Start()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "testenv: starting the API server:", err)
+		// Start can fail after the API server and etcd are up (the CRD refused, say); without a Stop they outlive
+		// the test binary, as two pairs did on day 1.
+		if err := te.Stop(); err != nil {
+			fmt.Fprintln(os.Stderr, "testenv: stopping the API server:", err)
+		}
 		return 1
 	}
 	code := run(m, te, cfg, scheme)
