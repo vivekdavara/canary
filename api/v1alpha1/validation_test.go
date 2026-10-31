@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "github.com/vivekdavara/canary/api/v1alpha1"
+	"github.com/vivekdavara/canary/internal/revision"
 	"github.com/vivekdavara/canary/internal/testenv"
 )
 
@@ -282,6 +283,36 @@ func TestDefaultsAndTemplateLabelsSurvive(t *testing.T) {
 	}
 	if m := got.Spec.Analysis.Metrics[0].Max; m == nil || *m != 0.01 {
 		t.Errorf("max = %v; want 0.01", m)
+	}
+}
+
+// The API server fills defaults inside the pod template too (the CRD carries the pod schema's own defaults), so the
+// stored template can differ from the one a client sent: revisions are taken from the stored one.
+func TestServerDefaultsInsideTheTemplate(t *testing.T) {
+	env := testenv.Get(t)
+	r := valid("web")
+	r.Spec.Template.Spec.Containers[0].Ports = []corev1.ContainerPort{{ContainerPort: 8080}}
+	sent := r.Spec.Template.DeepCopy()
+	if err := create(t, r); err != nil {
+		t.Fatal(err)
+	}
+	var got v1.CanaryRollout
+	if err := env.Client.Get(context.Background(), client.ObjectKeyFromObject(r), &got); err != nil {
+		t.Fatal(err)
+	}
+	if p := got.Spec.Template.Spec.Containers[0].Ports[0].Protocol; p != corev1.ProtocolTCP {
+		t.Fatalf("stored port protocol %q; want the default TCP", p)
+	}
+	if revision.Of(sent) == revision.Of(&got.Spec.Template) {
+		t.Errorf("the sent and stored templates have the same revision; the default should have changed it")
+	}
+	// Reading it again gives the same revision: the defaults are stored, not applied on each read.
+	var again v1.CanaryRollout
+	if err := env.Client.Get(context.Background(), client.ObjectKeyFromObject(r), &again); err != nil {
+		t.Fatal(err)
+	}
+	if revision.Of(&again.Spec.Template) != revision.Of(&got.Spec.Template) {
+		t.Errorf("two reads of one object gave different revisions")
 	}
 }
 

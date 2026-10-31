@@ -216,4 +216,8 @@ failed since the step began.
   keep-alive connections stay where they were; with few pods the share is coarse (one pod of three is 33%, not the
   step's 10%). Exact per-request weights need a mesh or Gateway API `HTTPRoute` weights.
 - **`replicas` is at least 1.** Scaling a rollout to zero isn't supported in v1alpha1.
+- **A revision is tied to the encoding.** Building the operator against a newer `k8s.io/api` that adds a field
+  without `omitempty` would give every unchanged template a new revision, and so start a rollout of everything it
+  manages. `TestRevisionIsPinned` pins one template's revision so such an upgrade fails a test instead of shipping;
+  the fix then would be to compare templates semantically rather than by hash.
 - No HorizontalPodAutoscaler integration, no manual pause or approval, no webhook-based analysis.
