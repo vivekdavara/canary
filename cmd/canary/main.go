@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -19,6 +20,10 @@ import (
 	rolloutsv1alpha1 "github.com/vivekdavara/canary/api/v1alpha1"
 	"github.com/vivekdavara/canary/internal/controller"
 )
+
+// skipNameValidation is set by tests, which call run more than once in one process: controller-runtime refuses a
+// second controller of the same name in a process (their metrics would mix).
+var skipNameValidation = false
 
 func main() {
 	err := run(ctrl.SetupSignalHandler(), os.Args[1:])
@@ -41,6 +46,8 @@ func run(ctx context.Context, args []string) error {
 	metricsAddr := fs.String("metrics-bind-address", ":8111", "where the Prometheus metrics are served; 0 turns them off")
 	probeAddr := fs.String("health-probe-bind-address", ":8121", "where /healthz and /readyz are served")
 	leaderElect := fs.Bool("leader-elect", false, "elect a leader, so only one of several replicas reconciles")
+	leaderNamespace := fs.String("leader-election-namespace", "",
+		"the namespace of the leader's Lease; in a cluster, the operator's own by default (outside one, required)")
 	zapOpts := zap.Options{}
 	zapOpts.BindFlags(fs)
 	if err := fs.Parse(args); err != nil {
@@ -57,11 +64,13 @@ func run(ctx context.Context, args []string) error {
 		return fmt.Errorf("no Kubernetes configuration: %w", err)
 	}
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                metricsserver.Options{BindAddress: *metricsAddr},
-		HealthProbeBindAddress: *probeAddr,
-		LeaderElection:         *leaderElect,
-		LeaderElectionID:       "canary.rollouts.vivekdavara.github.io",
+		Scheme:                  scheme,
+		Metrics:                 metricsserver.Options{BindAddress: *metricsAddr},
+		HealthProbeBindAddress:  *probeAddr,
+		LeaderElection:          *leaderElect,
+		LeaderElectionID:        "canary.rollouts.vivekdavara.github.io",
+		LeaderElectionNamespace: *leaderNamespace,
+		Controller:              config.Controller{SkipNameValidation: &skipNameValidation},
 	})
 	if err != nil {
 		return fmt.Errorf("creating the manager: %w", err)

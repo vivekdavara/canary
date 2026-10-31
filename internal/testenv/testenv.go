@@ -122,15 +122,46 @@ func (e *Env) operatorUser(t testing.TB) *envtest.AuthenticatedUser {
 	return e.operator
 }
 
-func (e *Env) addOperator() (*envtest.AuthenticatedUser, error) {
-	const user = "canary-operator"
-	data, err := os.ReadFile(filepath.Join(repoRoot(), "config", "rbac", "role.yaml"))
-	if err != nil {
-		return nil, err
+// operatorUser is the name the operator's user authenticates as.
+const operatorUser = "canary-operator"
+
+// BindLeaderElection gives the operator's user config/rbac/leader_election_role.yaml in namespace ns, as a cluster
+// would where the operator runs with --leader-elect.
+func (e *Env) BindLeaderElection(t testing.TB, ns string) {
+	t.Helper()
+	var role rbacv1.Role
+	if err := readYAML(filepath.Join("config", "rbac", "leader_election_role.yaml"), &role); err != nil {
+		t.Fatal(err)
 	}
+	role.Namespace = ns
+	binding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: role.Name},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: role.Name},
+		Subjects:   []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: rbacv1.UserKind, Name: operatorUser}},
+	}
+	for _, obj := range []client.Object{&role, binding} {
+		if err := e.Client.Create(context.Background(), obj); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// readYAML decodes a file under the repository's root, refusing unknown fields.
+func readYAML(path string, into any) error {
+	data, err := os.ReadFile(filepath.Join(repoRoot(), path))
+	if err != nil {
+		return err
+	}
+	if err := yaml.UnmarshalStrict(data, into); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	return nil
+}
+
+func (e *Env) addOperator() (*envtest.AuthenticatedUser, error) {
 	var role rbacv1.ClusterRole
-	if err := yaml.UnmarshalStrict(data, &role); err != nil {
-		return nil, fmt.Errorf("config/rbac/role.yaml: %w", err)
+	if err := readYAML(filepath.Join("config", "rbac", "role.yaml"), &role); err != nil {
+		return nil, err
 	}
 	ctx := context.Background()
 	if err := e.Client.Create(ctx, &role); err != nil {
@@ -139,12 +170,12 @@ func (e *Env) addOperator() (*envtest.AuthenticatedUser, error) {
 	binding := &rbacv1.ClusterRoleBinding{
 		ObjectMeta: metav1.ObjectMeta{Name: role.Name},
 		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: role.Name},
-		Subjects:   []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: rbacv1.UserKind, Name: user}},
+		Subjects:   []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: rbacv1.UserKind, Name: operatorUser}},
 	}
 	if err := e.Client.Create(ctx, binding); err != nil {
 		return nil, err
 	}
-	return e.te.AddUser(envtest.User{Name: user}, e.Config)
+	return e.te.AddUser(envtest.User{Name: operatorUser}, e.Config)
 }
 
 // Get returns the package's Env, or skips the test when envtest isn't available.
