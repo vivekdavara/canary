@@ -11,24 +11,32 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kruntime "k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	"sigs.k8s.io/yaml"
 
 	rolloutsv1alpha1 "github.com/vivekdavara/canary/api/v1alpha1"
 )
 
-// Env is a running API server and a client for it.
+// Env is a running API server and a client for it. Config and Client are an administrator's.
 type Env struct {
 	Config *rest.Config
 	Scheme *kruntime.Scheme
 	Client client.Client
+
+	te           *envtest.Environment
+	operatorOnce sync.Once
+	operatorCfg  *rest.Config
+	operatorErr  error
 }
 
 var current *Env
@@ -62,7 +70,7 @@ func Main(m *testing.M) int {
 		fmt.Fprintln(os.Stderr, "testenv: starting the API server:", err)
 		return 1
 	}
-	code := run(m, cfg, scheme)
+	code := run(m, te, cfg, scheme)
 	if err := te.Stop(); err != nil {
 		fmt.Fprintln(os.Stderr, "testenv: stopping the API server:", err)
 		if code == 0 {
@@ -72,14 +80,55 @@ func Main(m *testing.M) int {
 	return code
 }
 
-func run(m *testing.M, cfg *rest.Config, scheme *kruntime.Scheme) int {
+func run(m *testing.M, te *envtest.Environment, cfg *rest.Config, scheme *kruntime.Scheme) int {
 	c, err := client.New(cfg, client.Options{Scheme: scheme})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "testenv: client:", err)
 		return 1
 	}
-	current = &Env{Config: cfg, Scheme: scheme, Client: c}
+	current = &Env{Config: cfg, Scheme: scheme, Client: c, te: te}
 	return m.Run()
+}
+
+// OperatorConfig is a configuration for a user holding exactly the operator's ClusterRole, config/rbac/role.yaml
+// (generated from the reconciler's rbac markers), so an operator run with it fails where a permission is missing,
+// as it would in a cluster. envtest's API server authorizes by RBAC; the administrator's Config bypasses it.
+func (e *Env) OperatorConfig(t testing.TB) *rest.Config {
+	t.Helper()
+	e.operatorOnce.Do(func() { e.operatorCfg, e.operatorErr = e.addOperator() })
+	if e.operatorErr != nil {
+		t.Fatalf("setting up the operator's user: %v", e.operatorErr)
+	}
+	return rest.CopyConfig(e.operatorCfg)
+}
+
+func (e *Env) addOperator() (*rest.Config, error) {
+	const user = "canary-operator"
+	data, err := os.ReadFile(filepath.Join(repoRoot(), "config", "rbac", "role.yaml"))
+	if err != nil {
+		return nil, err
+	}
+	var role rbacv1.ClusterRole
+	if err := yaml.UnmarshalStrict(data, &role); err != nil {
+		return nil, fmt.Errorf("config/rbac/role.yaml: %w", err)
+	}
+	ctx := context.Background()
+	if err := e.Client.Create(ctx, &role); err != nil {
+		return nil, err
+	}
+	binding := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: role.Name},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: role.Name},
+		Subjects:   []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: rbacv1.UserKind, Name: user}},
+	}
+	if err := e.Client.Create(ctx, binding); err != nil {
+		return nil, err
+	}
+	u, err := e.te.AddUser(envtest.User{Name: user}, e.Config)
+	if err != nil {
+		return nil, err
+	}
+	return u.Config(), nil
 }
 
 // Get returns the package's Env, or skips the test when envtest isn't available.

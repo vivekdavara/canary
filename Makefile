@@ -21,8 +21,10 @@ generate: $(CONTROLLER_GEN)
 # The CRD from the types and their markers. generateEmbeddedObjectMeta keeps the schema of spec.template.metadata, which
 # controller-gen otherwise drops, so the API server would prune the template's labels; allowDangerousTypes allows the
 # float64 thresholds (DESIGN.md, "Why these choices", says why both).
+# The operator's ClusterRole comes from the reconciler's rbac markers.
 manifests: $(CONTROLLER_GEN)
 	$(CONTROLLER_GEN) crd:generateEmbeddedObjectMeta=true,allowDangerousTypes=true paths=./api/... output:crd:artifacts:config=config/crd/bases
+	$(CONTROLLER_GEN) rbac:roleName=canary-manager paths=./internal/controller/... output:rbac:artifacts:config=config/rbac
 
 tools: $(CONTROLLER_GEN) $(SETUP_ENVTEST)
 

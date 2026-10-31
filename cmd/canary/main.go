@@ -1,5 +1,5 @@
-// Command canary runs the CanaryRollout operator: one controller-runtime manager watching CanaryRollouts and the
-// Deployments they own. DESIGN.md is the specification.
+// Command canary runs the CanaryRollout operator: one controller-runtime manager with one controller, watching
+// CanaryRollouts and the Deployments they own. DESIGN.md is the specification.
 package main
 
 import (
@@ -15,6 +15,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	rolloutsv1alpha1 "github.com/vivekdavara/canary/api/v1alpha1"
+	"github.com/vivekdavara/canary/internal/controller"
 )
 
 func main() {
@@ -54,6 +55,9 @@ func run(args []string) error {
 	})
 	if err != nil {
 		return fmt.Errorf("creating the manager: %w", err)
+	}
+	if err := (&controller.CanaryRolloutReconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setting up the controller: %w", err)
 	}
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		return err
