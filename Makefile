@@ -19,9 +19,10 @@ generate: $(CONTROLLER_GEN)
 	$(CONTROLLER_GEN) object paths=./api/...
 
 # The CRD from the types and their markers. generateEmbeddedObjectMeta keeps the schema of spec.template.metadata, which
-# controller-gen otherwise drops, so the API server would prune the template's labels (DESIGN.md, "Why these choices").
+# controller-gen otherwise drops, so the API server would prune the template's labels; allowDangerousTypes allows the
+# float64 thresholds (DESIGN.md, "Why these choices", says why both).
 manifests: $(CONTROLLER_GEN)
-	$(CONTROLLER_GEN) crd:generateEmbeddedObjectMeta=true paths=./api/... output:crd:artifacts:config=config/crd/bases
+	$(CONTROLLER_GEN) crd:generateEmbeddedObjectMeta=true,allowDangerousTypes=true paths=./api/... output:crd:artifacts:config=config/crd/bases
 
 tools: $(CONTROLLER_GEN) $(SETUP_ENVTEST)
 

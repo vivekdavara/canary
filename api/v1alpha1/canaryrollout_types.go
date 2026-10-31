@@ -2,7 +2,6 @@ package v1alpha1
 
 import (
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -97,7 +96,7 @@ type Analysis struct {
 // Metric is one Prometheus query and the range its result must stay in.
 //
 // +kubebuilder:validation:XValidation:rule="has(self.min) || has(self.max)",message="a metric needs min, max or both"
-// +kubebuilder:validation:XValidation:rule="!has(self.min) || !has(self.max) || quantity(string(self.min)).compareTo(quantity(string(self.max))) <= 0",message="min must not be greater than max"
+// +kubebuilder:validation:XValidation:rule="!has(self.min) || !has(self.max) || self.min <= self.max",message="min must not be greater than max"
 type Metric struct {
 	// Name identifies the metric in status and Events (a DNS label).
 	//
@@ -114,15 +113,15 @@ type Metric struct {
 	// +required
 	Query string `json:"query"`
 
-	// Min is the lowest passing value (a Kubernetes quantity: "0.5", "500m", 2).
+	// Min is the lowest passing value.
 	//
 	// +optional
-	Min *resource.Quantity `json:"min,omitempty"`
+	Min *float64 `json:"min,omitempty"`
 
-	// Max is the highest passing value (a Kubernetes quantity: "0.01", "10m", 2).
+	// Max is the highest passing value.
 	//
 	// +optional
-	Max *resource.Quantity `json:"max,omitempty"`
+	Max *float64 `json:"max,omitempty"`
 }
 
 // Phase is where a rollout is (DESIGN.md, "The state machine").

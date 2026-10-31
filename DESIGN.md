@@ -64,10 +64,10 @@ spec:
     metrics:
       - name: error-rate
         query: sum(rate(http_requests_total{app="web",track="canary",code=~"5.."}[1m])) / sum(rate(http_requests_total{app="web",track="canary"}[1m]))
-        max: 10m               # 0.01 (a Kubernetes quantity: "10m" is 0.01)
+        max: 0.01
       - name: p95-latency-seconds
         query: histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{app="web",track="canary"}[1m])))
-        max: 300m
+        max: 0.3
 ```
 
 ### Spec
@@ -92,9 +92,13 @@ Why these choices:
 - **The rollout holds the template** (like Argo Rollouts' `Rollout`), rather than pointing at a Deployment the user
   owns (like Flagger). Then the operator owns everything it changes, and nobody else's controller edits the same
   objects.
-- **Thresholds are `resource.Quantity`**, Kubernetes' exact decimal type (`10m`, `0.01`, `2`). CRDs discourage
-  floating-point fields because they don't round-trip through every client exactly; a quantity does, and the API
-  server checks its syntax.
+- **Thresholds are `float64`** (as in Flagger's `thresholdRange`). Kubernetes' API conventions discourage floats,
+  because not every client re-encodes them identically, and controller-gen needs `crd:allowDangerousTypes=true` for
+  them. But Prometheus answers in float64 and the comparison is made in float64, so a threshold of another type would
+  be converted anyway, and `max: 0.01` reads as it should. The first version used `resource.Quantity` (exact
+  decimals): `max: 0.01` unquoted was then refused (a quantity is an integer or a string), `10m` meant 0.01, and the
+  API server refused the CRD itself, because the `min <= max` rule's estimated cost over unbounded quantity strings
+  was 1.26 times its budget, and controller-gen won't put a `maxLength` on an int-or-string field.
 - **`template.metadata` is kept.** controller-gen normally drops the schema of an embedded `ObjectMeta`, and the API
   server then prunes the template's labels on write, so the pods would lose the labels the Service selects.
   `crd:generateEmbeddedObjectMeta=true` keeps labels and annotations; a test reads them back.

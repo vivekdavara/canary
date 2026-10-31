@@ -169,13 +169,13 @@ func (in *Metric) DeepCopyInto(out *Metric) {
 	*out = *in
 	if in.Min != nil {
 		in, out := &in.Min, &out.Min
-		x := (*in).DeepCopy()
-		*out = &x
+		*out = new(float64)
+		**out = **in
 	}
 	if in.Max != nil {
 		in, out := &in.Max, &out.Max
-		x := (*in).DeepCopy()
-		*out = &x
+		*out = new(float64)
+		**out = **in
 	}
 }
 

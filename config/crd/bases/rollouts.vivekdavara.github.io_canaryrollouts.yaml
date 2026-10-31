@@ -87,21 +87,11 @@ spec:
                         result must stay in.
                       properties:
                         max:
-                          anyOf:
-                          - type: integer
-                          - type: string
-                          description: 'Max is the highest passing value (a Kubernetes
-                            quantity: "0.01", "10m", 2).'
-                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                          x-kubernetes-int-or-string: true
+                          description: Max is the highest passing value.
+                          type: number
                         min:
-                          anyOf:
-                          - type: integer
-                          - type: string
-                          description: 'Min is the lowest passing value (a Kubernetes
-                            quantity: "0.5", "500m", 2).'
-                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                          x-kubernetes-int-or-string: true
+                          description: Min is the lowest passing value.
+                          type: number
                         name:
                           description: Name identifies the metric in status and Events
                             (a DNS label).
@@ -123,8 +113,7 @@ spec:
                       - message: a metric needs min, max or both
                         rule: has(self.min) || has(self.max)
                       - message: min must not be greater than max
-                        rule: '!has(self.min) || !has(self.max) || quantity(string(self.min)).compareTo(quantity(string(self.max)))
-                          <= 0'
+                        rule: '!has(self.min) || !has(self.max) || self.min <= self.max'
                     maxItems: 10
                     minItems: 1
                     type: array
