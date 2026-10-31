@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Tools and envtest binaries cache
+        # controller-gen, setup-envtest and envtest's kube-apiserver and etcd, all pinned in the Makefile, so the
+        # Makefile is the key: a version bump there misses the cache.
+        uses: actions/cache@v6
+        with:
+          path: bin
+          key: tools-${{ runner.os }}-${{ hashFiles('Makefile') }}
+      - name: Check
+        # Regenerates the deep copies, the CRD and the ClusterRole, then gofmt, vet, and every test (envtest's
+        # suites fail rather than skip without their binaries: make test sets CANARY_REQUIRE_ENVTEST).
+        run: make check
+      - name: Generated files are committed
+        # make check rewrote them from the types and markers; any difference means a commit without them.
+        run: |
+          git status --porcelain
+          test -z "$(git status --porcelain)"
+      - name: Build
+        run: make build
