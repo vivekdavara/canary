@@ -298,7 +298,7 @@ skip a raised weight, because the edit itself can make a running pause finished.
 from the step index, which was wrong both ways. The fixes: a finished pause is kept only when the canary has *more*
 pods than the step's (weights strictly increase, so that's exactly a lost advance), and a promotion now marks the
 stable with an annotation in the same write as its template, so the next decision knows rather than guesses. Three
-rounds, each finding bugs in the last one's fixes; the last two found nothing in code written before the reviews.
+rounds, and each of the last two found bugs in the previous round's fixes.
 
 **Why an annotation rather than more status?**
 The status write is the one that can be lost; the mark has to travel with the Deployment write it describes. The

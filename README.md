@@ -150,9 +150,10 @@ misspelling `failureLimit` in the sample fails `TestSamplesAreAccepted`.
 No cluster runs here (no kind locally; day 4 runs one in CI), so there are no rollout timings yet. What was measured
 (Apple M3, on battery):
 
-- `make check` warm: 17.51 s real (`/usr/bin/time -p make check` at `d1cec47`, with a review agent's tests running at
-  the same time): 44 top-level tests (`go test -list '.*' ./... | grep -c ^Test`), all six packages `ok`, none
-  skipped.
+- `make check` warm: 28.61 s real at `fa27f39` on AC with nothing else running (`/usr/bin/time -p make check`): 70
+  top-level tests (`go test -list '.*' ./... | grep -c ^Test`), all six packages `ok`, none skipped. It includes a
+  second API server started for the `OwnerReferencesPermissionEnforcement` test. Earlier, at `d1cec47` (44 tests, on
+  battery, a review agent's tests running at the same time), it was 17.51 s.
 - `TestRandomWalks`: 3,000 walks of 60 random actions plus a settling tail, 0.12 s
   (`go test -run TestRandomWalks -v ./internal/rollout/`). `TestRandomWalksWithEdits`: 5,000 walks of 80 moves,
 0.22 s; its census (printed with `-v`) at `bdc3c33`: 49,778 lost status writes, 17,265 lost ready pods, about 15,000
