@@ -417,3 +417,27 @@ func readyOf(d *Deployment) int32 {
 	}
 	return d.ReadyReplicas
 }
+
+// The operator writes the Deployments, then the status. If the status write fails after the promotion gave the stable
+// the template, the next decision still sees a promotion (not a revert): the canary is kept, and Promoted follows.
+func TestAPromotionWhoseStatusWasLost(t *testing.T) {
+	w := newWorld(t, 4, step(50, 0))
+	w.run()
+	w.settle()
+	w.rev = "r2"
+	w.run()
+	w.settle()
+	before := w.state
+	w.run()
+	w.expect(v1.PhasePromoting, 4, 2)
+	w.state = before // the status write failed
+	w.events = nil
+	w.run()
+	w.expect(v1.PhasePromoting, 4, 2)
+	w.settle()
+	w.run()
+	w.expect(v1.PhaseHealthy, 4, 0)
+	if want := []string{EventPromoted}; !slices.Equal(w.events, want) {
+		t.Fatalf("events %v; want %v", w.events, want)
+	}
+}

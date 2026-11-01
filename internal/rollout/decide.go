@@ -119,8 +119,10 @@ func Decide(in Input) Plan {
 	inRollout := last.CanaryRevision == rev && (last.Phase == v1.PhaseProgressing || last.Phase == v1.PhasePromoting)
 
 	// Promotion: the stable takes the template at all replicas, and the canary keeps its pods until the stable's
-	// are ready, so capacity never drops.
-	if inRollout && last.Phase == v1.PhasePromoting {
+	// are ready, so capacity never drops. A stable already at the revision under test means a promotion too: the
+	// operator writes the Deployments before the status, so a status write that failed after the stable took the
+	// template leaves the phase at Progressing.
+	if inRollout && (last.Phase == v1.PhasePromoting || stable.Revision == rev) {
 		if stable.readyAt(rev, r) {
 			return Plan{
 				Stable:  Target{Replicas: r},
