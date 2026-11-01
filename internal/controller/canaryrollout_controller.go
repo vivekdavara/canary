@@ -69,13 +69,16 @@ func New(mgr ctrl.Manager) *CanaryRolloutReconciler {
 }
 
 // The permissions the operator needs, generated into config/rbac/role.yaml by make manifests: no more than the code
-// uses. The status is only patched; Deployments are created and updated, never deleted (owner references let the
-// garbage collector do that); Events are created, and patched when one repeats. --leader-elect's Lease is in
-// config/rbac/leader_election_role.yaml, a namespaced Role.
+// uses. Rollouts are read with a GET and watched; the status is only patched. Deployments are read from the cache
+// (list and watch, no get), created and updated, never deleted (owner references let the garbage collector do that).
+// A controller reference sets blockOwnerDeletion, which clusters running the OwnerReferencesPermissionEnforcement
+// admission plugin (OpenShift does) allow only to users who may update the owner's finalizers. Events are created,
+// and patched when one repeats. --leader-elect's Lease is in config/rbac/leader_election_role.yaml, a namespaced Role.
 //
 // +kubebuilder:rbac:groups=rollouts.vivekdavara.github.io,resources=canaryrollouts,verbs=get;list;watch
 // +kubebuilder:rbac:groups=rollouts.vivekdavara.github.io,resources=canaryrollouts/status,verbs=patch
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update
+// +kubebuilder:rbac:groups=rollouts.vivekdavara.github.io,resources=canaryrollouts/finalizers,verbs=update
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=list;watch;create;update
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile moves one rollout a step on: it reads the rollout and its two Deployments, asks the state machine
@@ -96,6 +99,11 @@ func (r *CanaryRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.APIReader.Get(ctx, req.NamespacedName, u); err != nil {
 		// Deleted since the event: its Deployments go with it (owner references), nothing to do.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if u.GetDeletionTimestamp() != nil {
+		// Being deleted (a foreground delete waits for the garbage collector to remove the Deployments first):
+		// recreating them would fight the deletion.
+		return ctrl.Result{}, nil
 	}
 	var ro rolloutsv1alpha1.CanaryRollout
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &ro); err != nil {

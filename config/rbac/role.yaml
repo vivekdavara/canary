@@ -10,7 +10,6 @@ rules:
   - deployments
   verbs:
   - create
-  - get
   - list
   - update
   - watch
@@ -29,6 +28,12 @@ rules:
   - get
   - list
   - watch
+- apiGroups:
+  - rollouts.vivekdavara.github.io
+  resources:
+  - canaryrollouts/finalizers
+  verbs:
+  - update
 - apiGroups:
   - rollouts.vivekdavara.github.io
   resources:
