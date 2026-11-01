@@ -99,6 +99,21 @@ func reasons(t *testing.T, c client.Client, ns, name string) []string {
 	return out
 }
 
+// eventType is the type (Normal, Warning) of the rollout's Event with the given reason, "" when there is none.
+func eventType(t *testing.T, c client.Client, ns, name, reason string) string {
+	t.Helper()
+	var list eventsv1.EventList
+	if err := c.List(context.Background(), &list, client.InNamespace(ns)); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range list.Items {
+		if e.Regarding.Kind == "CanaryRollout" && e.Regarding.Name == name && e.Reason == reason {
+			return e.Type
+		}
+	}
+	return ""
+}
+
 // TestARolloutEndToEnd follows DESIGN.md's state machine through a whole rollout against the API server, with the
 // operator's own permissions: the stable on first apply, then a new image in steps of 25% and 50% of 4 pods, then the
 // promotion.
@@ -133,6 +148,10 @@ func TestARolloutEndToEnd(t *testing.T) {
 	}
 	if got.Status.Phase != rolloutsv1alpha1.PhaseHealthy || got.Status.StableRevision != rev1 {
 		t.Errorf("status %+v; want Healthy at %s", got.Status, rev1)
+	}
+	// No pod is ready yet.
+	if cond := meta.FindStatusCondition(got.Status.Conditions, ConditionAvailable); cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != ReasonNotEnoughPods {
+		t.Errorf("Available = %+v; want False, %s, before any pod is ready", cond, ReasonNotEnoughPods)
 	}
 	markReady(t, c, ns, stableName)
 	got = eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.StableReplicas == 4 })
@@ -180,10 +199,17 @@ func TestARolloutEndToEnd(t *testing.T) {
 	want := []string{rollout.EventRolloutStarted, rollout.EventStepAdvanced, rollout.EventPromoting, rollout.EventPromoted}
 	for range poll(t) {
 		if slices.Equal(reasons(t, c, ns, "web"), want) {
-			return
+			break
 		}
 	}
-	t.Errorf("events %v; want %v", reasons(t, c, ns, "web"), want)
+	if got := reasons(t, c, ns, "web"); !slices.Equal(got, want) {
+		t.Errorf("events %v; want %v", got, want)
+	}
+	for _, reason := range want {
+		if typ := eventType(t, c, ns, "web", reason); typ != "Normal" {
+			t.Errorf("the %s Event is %q; want Normal", reason, typ)
+		}
+	}
 }
 
 func maps(a, b map[string]string) bool {
@@ -219,6 +245,10 @@ func TestAPauseEndsOnItsOwn(t *testing.T) {
 	markReady(t, c, ns, "web-canary")
 	got = eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.StepStartedAt != nil })
 	started := got.Status.StepStartedAt.Time
+	// Read with the stable's 2 pods still ready and the canary's 1: a third, rounded down.
+	if got.Status.StableReplicas != 2 || got.Status.CanaryReplicas != 1 || got.Status.CanaryWeight != 33 {
+		t.Errorf("ready pods %d stable, %d canary, weight %d; want 2, 1, 33", got.Status.StableReplicas, got.Status.CanaryReplicas, got.Status.CanaryWeight)
+	}
 	if cond := meta.FindStatusCondition(got.Status.Conditions, ConditionProgressing); cond == nil || cond.Reason != rollout.ReasonStepPaused {
 		t.Errorf("Progressing = %+v; want StepPaused", cond)
 	}
@@ -262,8 +292,8 @@ func TestATemplateTheAPIServerRefuses(t *testing.T) {
 			break
 		}
 	}
-	if !slices.Contains(reasons(t, c, ns, "web"), ReasonInvalidSpec) {
-		t.Errorf("events %v; want an InvalidSpec Warning", reasons(t, c, ns, "web"))
+	if typ := eventType(t, c, ns, "web", ReasonInvalidSpec); typ != "Warning" {
+		t.Errorf("events %v, the InvalidSpec one %q; want an InvalidSpec Warning", reasons(t, c, ns, "web"), typ)
 	}
 
 	got = edit(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) { r.Spec.Template.Labels["app"] = "web" })
@@ -303,6 +333,14 @@ func TestSomeoneElsesDeploymentWithTheName(t *testing.T) {
 	})
 	if cond := meta.FindStatusCondition(got.Status.Conditions, ConditionProgressing); !strings.Contains(cond.Message, "web-stable") {
 		t.Errorf("message %q; want it to name the Deployment", cond.Message)
+	}
+	for range poll(t) {
+		if eventType(t, c, ns, "web", ReasonDeploymentConflict) != "" {
+			break
+		}
+	}
+	if typ := eventType(t, c, ns, "web", ReasonDeploymentConflict); typ != "Warning" {
+		t.Errorf("the DeploymentConflict Event is %q; want Warning", typ)
 	}
 	if d := deploymentWhen(t, c, ns, "web-stable", func(d *appsv1.Deployment) bool { return d != nil }); ptr.Deref(d.Spec.Replicas, 0) != 7 || len(d.OwnerReferences) != 0 {
 		t.Errorf("their Deployment was changed: %+v", d)

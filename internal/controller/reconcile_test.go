@@ -2,14 +2,17 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -186,4 +189,107 @@ func TestANewOperatorCarriesOn(t *testing.T) {
 	if after.ResourceVersion != canary.ResourceVersion {
 		t.Errorf("the canary Deployment was rewritten by the new operator (resourceVersion %s, was %s)", after.ResourceVersion, canary.ResourceVersion)
 	}
+}
+
+// Events go out only once the status write that records their transition succeeds: a reconcile whose write loses a
+// conflict sends none, and the next one, deciding again from the same status, sends them once.
+func TestEventsOnlyAfterTheStatusIsWritten(t *testing.T) {
+	env := testenv.Get(t)
+	ctx := context.Background()
+	ns := env.Namespace(t)
+	ro := newRollout(ns, "example.com/web:1")
+	if err := env.Client.Create(ctx, ro); err != nil {
+		t.Fatal(err)
+	}
+	var conflict atomic.Bool
+	r := direct(t, interceptor.Funcs{
+		SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			if conflict.Load() {
+				return apierrors.NewConflict(rolloutsv1alpha1.GroupVersion.WithResource("canaryrollouts").GroupResource(), obj.GetName(), errors.New("injected"))
+			}
+			return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
+		},
+	})
+	recorder := r.Recorder.(*events.FakeRecorder)
+	reconcileOnce(t, r, ro)
+	markReady(t, env.Client, ns, "web-stable")
+	reconcileOnce(t, r, ro)
+	edit(t, env.Client, client.ObjectKeyFromObject(ro), func(r *rolloutsv1alpha1.CanaryRollout) {
+		r.Spec.Template.Spec.Containers[0].Image = "example.com/web:2"
+	})
+
+	conflict.Store(true)
+	reconcileOnce(t, r, ro)
+	if n := len(recorder.Events); n != 0 {
+		t.Fatalf("%d Events after a status write that lost its conflict; want none", n)
+	}
+	conflict.Store(false)
+	reconcileOnce(t, r, ro)
+	reconcileOnce(t, r, ro)
+	var got []string
+	for len(recorder.Events) > 0 {
+		got = append(got, <-recorder.Events)
+	}
+	if len(got) != 1 || !strings.HasPrefix(got[0], "Normal RolloutStarted ") {
+		t.Errorf("Events %q; want one RolloutStarted", got)
+	}
+}
+
+// An undecodable rollout's report is written once (a second reconcile finds it there and writes nothing), and with
+// the resourceVersion it read, so a rollout changed meanwhile isn't reported from the older read.
+func TestAnUndecodableRolloutsReport(t *testing.T) {
+	env := testenv.Get(t)
+	ctx := context.Background()
+	key := func(ns string) client.ObjectKey { return client.ObjectKey{Namespace: ns, Name: "web"} }
+	unstructuredAt := func(k client.ObjectKey) *unstructured.Unstructured {
+		u := &unstructured.Unstructured{}
+		u.SetGroupVersionKind(rolloutsv1alpha1.GroupVersion.WithKind("CanaryRollout"))
+		if err := env.Client.Get(ctx, k, u); err != nil {
+			t.Fatal(err)
+		}
+		return u
+	}
+	request := func(ns string) *rolloutsv1alpha1.CanaryRollout {
+		return &rolloutsv1alpha1.CanaryRollout{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "web"}}
+	}
+
+	t.Run("written once", func(t *testing.T) {
+		ns := env.Namespace(t)
+		createRaw(t, ns, undecodable(t, ns))
+		var patches atomic.Int32
+		r := direct(t, interceptor.Funcs{
+			SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				patches.Add(1)
+				return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
+			},
+		})
+		reconcileOnce(t, r, request(ns))
+		reconcileOnce(t, r, request(ns))
+		if n := patches.Load(); n != 1 {
+			t.Errorf("%d status patches for two reconciles of the same undecodable rollout; want 1", n)
+		}
+		if st, _ := unstructuredAt(key(ns)).Object["status"].(map[string]any); st == nil || st["observedGeneration"] == nil {
+			t.Errorf("status %v; want the report", st)
+		}
+	})
+
+	t.Run("locked", func(t *testing.T) {
+		ns := env.Namespace(t)
+		createRaw(t, ns, undecodable(t, ns))
+		r := direct(t, interceptor.Funcs{
+			SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				// Someone changes the rollout between the operator's read and its write.
+				u := unstructuredAt(key(ns))
+				u.SetAnnotations(map[string]string{"changed": "meanwhile"})
+				if err := env.Client.Update(ctx, u); err != nil {
+					return err
+				}
+				return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
+			},
+		})
+		reconcileOnce(t, r, request(ns))
+		if st := unstructuredAt(key(ns)).Object["status"]; st != nil {
+			t.Errorf("status %v written over a rollout that changed after it was read; want none", st)
+		}
+	})
 }
