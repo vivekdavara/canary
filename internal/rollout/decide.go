@@ -105,11 +105,12 @@ func Decide(in Input) Plan {
 
 	// No stable Deployment: create it from the template, at all replicas. On a first apply there is nothing to
 	// compare the template with; if the stable was deleted, the version it ran is gone with it, so the template
-	// becomes the stable version either way.
+	// becomes the stable version either way. A canary keeps its pods (the next decision takes it to 0 once the new
+	// stable is ready), since they may be the only ones serving.
 	if stable == nil {
 		return Plan{
 			Stable:  Target{Replicas: r, FromTemplate: true},
-			Canary:  Target{Replicas: 0},
+			Canary:  Target{Replicas: replicasOf(canary)},
 			State:   State{Phase: v1.PhaseHealthy, StableRevision: rev},
 			Reason:  ReasonIdle,
 			Message: fmt.Sprintf("creating the stable Deployment at revision %s", rev),
@@ -123,6 +124,13 @@ func Decide(in Input) Plan {
 	// operator writes the Deployments before the status, so a status write that failed after the stable took the
 	// template leaves the phase at Progressing.
 	if inRollout && (last.Phase == v1.PhasePromoting || stable.Revision == rev) {
+		// The steps may have changed since (they aren't part of the template): the index stays in range.
+		step := ptr(stepIndex(last.CurrentStep, in.Spec))
+		var events []Event
+		if last.Phase != v1.PhasePromoting {
+			// The status write that recorded the promotion's start was lost, and its Event with it.
+			events = append(events, Event{EventPromoting, fmt.Sprintf("the last step passed; promoting revision %s", rev)})
+		}
 		if stable.readyAt(rev, r) {
 			return Plan{
 				Stable:  Target{Replicas: r},
@@ -130,15 +138,16 @@ func Decide(in Input) Plan {
 				State:   State{Phase: v1.PhaseHealthy, StableRevision: rev},
 				Reason:  ReasonIdle,
 				Message: fmt.Sprintf("revision %s promoted: the stable runs it", rev),
-				Events:  []Event{{EventPromoted, fmt.Sprintf("revision %s promoted: the stable runs it at %d pods", rev, r)}},
+				Events:  append(events, Event{EventPromoted, fmt.Sprintf("revision %s promoted: the stable runs it at %d pods", rev, r)}),
 			}
 		}
 		return Plan{
 			Stable:  Target{Replicas: r, FromTemplate: true},
 			Canary:  Target{Replicas: replicasOf(canary)},
-			State:   State{Phase: v1.PhasePromoting, StableRevision: rev, CanaryRevision: rev, CurrentStep: last.CurrentStep},
+			State:   State{Phase: v1.PhasePromoting, StableRevision: rev, CanaryRevision: rev, CurrentStep: step},
 			Reason:  ReasonPromoting,
 			Message: fmt.Sprintf("promoting revision %s: waiting for the stable's %d pods to be ready", rev, r),
+			Events:  events,
 		}
 	}
 
@@ -177,11 +186,17 @@ func Decide(in Input) Plan {
 	st.StableRevision = stable.Revision
 
 	// The step. Steps can change mid-rollout (they aren't part of the template), so the index is kept in range.
-	i := min(max(deref(st.CurrentStep), 0), int32(len(in.Spec.Steps)-1))
+	i := stepIndex(st.CurrentStep, in.Spec)
 	st.CurrentStep = ptr(i)
 	c, s := Split(r, in.Spec.Steps[i].Weight)
+	// A pause belongs to the pods it started with. If the canary is no longer set to this step's count and revision
+	// (the steps or replicas were edited, or a status write was lost while the template changed and changed back),
+	// the step waits for its pods again, under the capacity rules, and its pause starts over.
+	if st.StepStartedAt != nil && !(canary != nil && canary.Revision == rev && canary.Replicas == c) {
+		st.StepStartedAt = nil
+	}
 	if st.StepStartedAt == nil && canary.readyAt(rev, c) {
-		st.StepStartedAt = &metav1.Time{Time: in.Now}
+		st.StepStartedAt = &metav1.Time{Time: ceilSecond(in.Now)}
 	}
 	if st.StepStartedAt == nil {
 		return waitForCanary(in, st, i, events)
@@ -206,7 +221,7 @@ func Decide(in Input) Plan {
 		st.StepStartedAt = nil // the step is over; currentStep stays at the last one
 		return Plan{
 			Stable:  Target{Replicas: r, FromTemplate: true},
-			Canary:  Target{Replicas: c, FromTemplate: true},
+			Canary:  Target{Replicas: replicasOf(canary)},
 			State:   st,
 			Reason:  ReasonPromoting,
 			Message: fmt.Sprintf("promoting revision %s: waiting for the stable's %d pods to be ready", rev, r),
@@ -265,11 +280,23 @@ func replicasOf(d *Deployment) int32 {
 	return d.Replicas
 }
 
-func deref(p *int32) int32 {
-	if p == nil {
-		return 0
+// stepIndex is the status's step index kept within the spec's steps (0 when there is none).
+func stepIndex(p *int32, spec *v1.CanaryRolloutSpec) int32 {
+	i := int32(0)
+	if p != nil {
+		i = *p
 	}
-	return *p
+	return min(max(i, 0), int32(len(spec.Steps)-1))
+}
+
+// ceilSecond rounds t up to a whole second. The API server stores status times to the second, so a pause start
+// written with its fraction would be read back up to a second earlier, and the pause would end that much early;
+// rounded up, it runs at least its full length.
+func ceilSecond(t time.Time) time.Time {
+	if s := t.Truncate(time.Second); s.Before(t) {
+		return s.Add(time.Second)
+	}
+	return t
 }
 
 func ptr[T any](v T) *T { return &v }

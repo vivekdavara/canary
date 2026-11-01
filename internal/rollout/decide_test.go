@@ -281,10 +281,16 @@ func TestADeletedStableIsRecreatedFromTheTemplate(t *testing.T) {
 	w.run()
 	w.stable = nil
 	w.run()
-	w.expect(v1.PhaseHealthy, 4, 0)
+	// The canary's pods may be the only ones serving: they stay until the new stable's are ready.
+	w.expect(v1.PhaseHealthy, 4, 2)
 	if w.stable.Revision != "r2" || w.state.CanaryRevision != "" {
 		t.Fatalf("stable %+v, state %+v", w.stable, w.state)
 	}
+	w.run()
+	w.expect(v1.PhaseHealthy, 4, 2)
+	w.settle()
+	w.run()
+	w.expect(v1.PhaseHealthy, 4, 0)
 }
 
 // Steps aren't part of the template, so they can shrink mid-rollout: the step index stays in range.
@@ -419,7 +425,8 @@ func readyOf(d *Deployment) int32 {
 }
 
 // The operator writes the Deployments, then the status. If the status write fails after the promotion gave the stable
-// the template, the next decision still sees a promotion (not a revert): the canary is kept, and Promoted follows.
+// the template, the next decision still sees a promotion (not a revert): the canary is kept, the lost Promoting Event
+// is sent then, and Promoted follows.
 func TestAPromotionWhoseStatusWasLost(t *testing.T) {
 	w := newWorld(t, 4, step(50, 0))
 	w.run()
@@ -437,7 +444,128 @@ func TestAPromotionWhoseStatusWasLost(t *testing.T) {
 	w.settle()
 	w.run()
 	w.expect(v1.PhaseHealthy, 4, 0)
-	if want := []string{EventPromoted}; !slices.Equal(w.events, want) {
+	if want := []string{EventPromoting, EventPromoted}; !slices.Equal(w.events, want) {
 		t.Fatalf("events %v; want %v", w.events, want)
+	}
+}
+
+// Random walks with everything a user or the cluster can do mid-rollout: edit the steps or replicas, change the
+// template at any time (a new version, back to the stable's, back to the previous one), delete either Deployment,
+// and lose a status write (the Deployments written, the status not). Day 2's review found five defects in exactly
+// these moves, which the walks above never made. After every decision:
+//   - capacity: the decision itself never takes the ready pods below min(replicas, what was ready before it);
+//   - when its status was written, the status agrees with itself and with the Deployments;
+//   - and when the walk ends, pods becoming ready and time passing always reach Healthy at the template.
+func TestRandomWalksWithEdits(t *testing.T) {
+	census := map[string]int{}
+	for seed := range uint64(5000) {
+		rng := rand.New(rand.NewPCG(seed, 11))
+		w := newWorld(t, int32(1+rng.IntN(12)), randomSteps(rng)...)
+		w.run()
+		w.settle()
+		revs, prev := 1, ""
+		for i := range 80 {
+			lost := false
+			switch rng.IntN(12) {
+			case 0, 1, 2:
+				w.settleSome(rng)
+			case 3, 4:
+				w.now = w.now.Add(time.Duration(rng.IntN(150)) * time.Second)
+			case 5:
+				census["steps edited"]++
+				w.spec.Steps = randomSteps(rng)
+			case 6:
+				census["replicas changed"]++
+				w.spec.Replicas = int32(1 + rng.IntN(12))
+			case 7:
+				switch rng.IntN(3) {
+				case 0:
+					revs++
+					prev, w.rev = w.rev, fmt.Sprintf("r%d", revs)
+				case 1:
+					prev, w.rev = w.rev, w.stable.Revision
+				default:
+					if prev != "" {
+						prev, w.rev = w.rev, prev
+					}
+				}
+				if w.state.Phase != v1.PhaseHealthy {
+					census["template changed mid-rollout"]++
+				}
+			case 8:
+				if rng.IntN(2) == 0 {
+					census["stable deleted"]++
+					w.stable = nil
+				} else if w.canary != nil {
+					census["canary deleted"]++
+					w.canary = nil
+				}
+			case 9:
+				lost = true
+				census["status write lost"]++
+			}
+			w.step(seed, i, lost)
+		}
+		for range 6 * (len(w.spec.Steps) + 2) {
+			w.settle()
+			w.now = w.now.Add(3 * time.Minute)
+			w.step(seed, -1, false)
+		}
+		r := w.spec.Replicas
+		if w.state.Phase != v1.PhaseHealthy || w.stable.Revision != w.rev || replicasOf(w.canary) != 0 || w.stable.Replicas != r {
+			t.Fatalf("seed %d: ended %+v, stable %+v, canary %+v; want Healthy at %s with %d pods", seed, w.state, w.stable, w.canary, w.rev, r)
+		}
+	}
+	// The walks must actually make the moves they're for.
+	for _, move := range []string{"steps edited", "replicas changed", "template changed mid-rollout", "stable deleted", "canary deleted", "status write lost"} {
+		if census[move] < 1000 {
+			t.Errorf("%q happened %d times in the walks; want at least 1000", move, census[move])
+		}
+	}
+	t.Logf("moves: %v", census)
+}
+
+// randomSteps is 1 to 4 strictly increasing weights with pauses of 0 to 2 minutes.
+func randomSteps(rng *rand.Rand) []v1.Step {
+	var steps []v1.Step
+	for w := int32(0); ; {
+		w += int32(1 + rng.IntN(60))
+		steps = append(steps, step(min(w, 100), time.Duration(rng.IntN(3))*time.Minute))
+		if w >= 100 || len(steps) == 4 || rng.IntN(3) == 0 {
+			return steps
+		}
+	}
+}
+
+// step decides once and applies the plan, checking capacity; with lost, the status write is dropped (the Deployments
+// were written first), otherwise the status is checked too.
+func (w *world) step(seed uint64, i int, lost bool) {
+	w.t.Helper()
+	before := readyOf(w.stable) + readyOf(w.canary)
+	last := w.state
+	w.run()
+	if after := readyOf(w.stable) + readyOf(w.canary); after < min(w.spec.Replicas, before) {
+		w.t.Fatalf("seed %d step %d: a decision took the ready pods from %d to %d (replicas %d); stable %+v, canary %+v, state %+v, steps %+v",
+			seed, i, before, after, w.spec.Replicas, w.stable, w.canary, w.state, w.spec.Steps)
+	}
+	if lost {
+		w.state = last
+		return
+	}
+	st := w.state
+	switch st.Phase {
+	case v1.PhaseHealthy:
+		if st.CanaryRevision != "" || st.CurrentStep != nil || st.StepStartedAt != nil || st.StableRevision != w.stable.Revision {
+			w.t.Fatalf("seed %d step %d: Healthy with %+v (stable %+v)", seed, i, st, w.stable)
+		}
+	case v1.PhaseProgressing, v1.PhasePromoting:
+		if st.CanaryRevision != w.rev || st.CurrentStep == nil || int(*st.CurrentStep) >= len(w.spec.Steps) || st.StableRevision != w.stable.Revision {
+			w.t.Fatalf("seed %d step %d: %s with %+v (template %s, stable %+v, %d steps)", seed, i, st.Phase, st, w.rev, w.stable, len(w.spec.Steps))
+		}
+		if st.StepStartedAt != nil && (w.canary == nil || w.canary.Revision != w.rev) {
+			w.t.Fatalf("seed %d step %d: a pause running with the canary at %+v, not %s", seed, i, w.canary, w.rev)
+		}
+	default:
+		w.t.Fatalf("seed %d step %d: phase %q", seed, i, st.Phase)
 	}
 }
