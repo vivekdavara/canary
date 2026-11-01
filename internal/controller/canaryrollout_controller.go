@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -21,6 +22,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	rolloutsv1alpha1 "github.com/vivekdavara/canary/api/v1alpha1"
 	"github.com/vivekdavara/canary/internal/revision"
@@ -297,12 +300,36 @@ func (r *CanaryRolloutReconciler) reportUndecodable(ctx context.Context, u *unst
 	return nil
 }
 
-// SetupWithManager registers the reconciler: it runs for each change to a CanaryRollout and to a Deployment one
-// owns. Rollouts are watched metadata-only (Reconcile says why).
+// SetupWithManager registers the reconciler: it runs for each change to a CanaryRollout, to a Deployment one owns, and
+// to a Deployment that has one of a rollout's names without being its own (so a DeploymentConflict clears itself when
+// that Deployment goes). Rollouts are watched metadata-only (Reconcile says why).
 func (r *CanaryRolloutReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&rolloutsv1alpha1.CanaryRollout{}, builder.OnlyMetadata).
 		Owns(&appsv1.Deployment{}).
+		Watches(&appsv1.Deployment{}, handler.EnqueueRequestsFromMapFunc(r.rolloutNamedFor)).
 		Named("canaryrollout").
 		Complete(r)
+}
+
+// rolloutNamedFor maps a Deployment called <name>-stable or <name>-canary that no CanaryRollout controls to rollout
+// <name> in its namespace, if one exists (checked in the metadata cache the rollout watch already keeps, so other
+// Deployments cost no request).
+func (r *CanaryRolloutReconciler) rolloutNamedFor(ctx context.Context, d client.Object) []reconcile.Request {
+	if ref := metav1.GetControllerOf(d); ref != nil && ref.Kind == "CanaryRollout" && strings.HasPrefix(ref.APIVersion, rolloutsv1alpha1.GroupVersion.Group+"/") {
+		return nil // Owns handles it
+	}
+	name, ok := strings.CutSuffix(d.GetName(), "-"+TrackStable)
+	if !ok {
+		if name, ok = strings.CutSuffix(d.GetName(), "-"+TrackCanary); !ok {
+			return nil
+		}
+	}
+	key := client.ObjectKey{Namespace: d.GetNamespace(), Name: name}
+	ro := &metav1.PartialObjectMetadata{}
+	ro.SetGroupVersionKind(rolloutsv1alpha1.GroupVersion.WithKind("CanaryRollout"))
+	if err := r.Get(ctx, key, ro); err != nil {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: key}}
 }

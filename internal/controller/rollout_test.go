@@ -273,7 +273,7 @@ func TestATemplateTheAPIServerRefuses(t *testing.T) {
 }
 
 // A Deployment named web-stable that the rollout doesn't control is left alone and reported; once it's gone, the
-// rollout creates its own.
+// rollout creates its own, without anything else waking it.
 func TestSomeoneElsesDeploymentWithTheName(t *testing.T) {
 	c := startOperator(t)
 	ctx := context.Background()
@@ -306,12 +306,50 @@ func TestSomeoneElsesDeploymentWithTheName(t *testing.T) {
 		t.Errorf("their Deployment was changed: %+v", d)
 	}
 
+	// Deleting it wakes the operator for the rollout of that name (it watches Deployments with a rollout's names, not
+	// only its own), with nothing else changing.
 	if err := c.Delete(ctx, theirs); err != nil {
 		t.Fatal(err)
 	}
-	// Deleting it is an event for a Deployment the rollout doesn't own, so nothing wakes the operator for this
-	// rollout; a change to the rollout does.
-	edit(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) { r.Annotations = map[string]string{"poke": "1"} })
 	got = eventually(t, c, key, phase(rolloutsv1alpha1.PhaseHealthy))
 	deploymentWhen(t, c, ns, "web-stable", at(got.Status.StableRevision, 4))
+}
+
+// A Deployment of the rollout's deleted by hand comes back: the stable from the template (the version it ran is gone
+// with it), the canary from the rollout in progress.
+func TestADeletedDeploymentComesBack(t *testing.T) {
+	c := startOperator(t)
+	ctx := context.Background()
+	ns := testenv.Get(t).Namespace(t)
+	ro := newRollout(ns, "example.com/web:1")
+	ro.Spec.Steps = []rolloutsv1alpha1.Step{{Weight: 50, Pause: &metav1.Duration{Duration: time.Hour}}}
+	if err := c.Create(ctx, ro); err != nil {
+		t.Fatal(err)
+	}
+	key := client.ObjectKeyFromObject(ro)
+	got := eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.StableRevision != "" })
+	rev1 := got.Status.StableRevision
+	markReady(t, c, ns, "web-stable")
+	got = edit(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) {
+		r.Spec.Template.Spec.Containers[0].Image = "example.com/web:2"
+	})
+	got = eventually(t, c, key, phase(rolloutsv1alpha1.PhaseProgressing))
+	rev2 := got.Status.CanaryRevision
+	canary := deploymentWhen(t, c, ns, "web-canary", at(rev2, 2))
+
+	if err := c.Delete(ctx, canary); err != nil {
+		t.Fatal(err)
+	}
+	deploymentWhen(t, c, ns, "web-canary", func(d *appsv1.Deployment) bool { return d != nil && d.UID != canary.UID && at(rev2, 2)(d) })
+	deploymentWhen(t, c, ns, "web-stable", at(rev1, 4))
+
+	stable := deploymentWhen(t, c, ns, "web-stable", func(d *appsv1.Deployment) bool { return d != nil })
+	if err := c.Delete(ctx, stable); err != nil {
+		t.Fatal(err)
+	}
+	deploymentWhen(t, c, ns, "web-stable", func(d *appsv1.Deployment) bool { return d != nil && d.UID != stable.UID && at(rev2, 4)(d) })
+	got = eventually(t, c, key, phase(rolloutsv1alpha1.PhaseHealthy))
+	if got.Status.StableRevision != rev2 {
+		t.Errorf("status %+v; want the template as the stable version", got.Status)
+	}
 }
