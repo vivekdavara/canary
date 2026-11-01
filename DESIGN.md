@@ -93,11 +93,15 @@ for the fields above):
 - **Ports in probes and lifecycle hooks beyond int32.** They are int-or-string fields, and the CRD's copy of the
   pod schema doesn't bound them, so `httpGet.port: 99999999999` is accepted and stored, and the operator's typed
   client then can't decode that object. Worse, a list is decoded as one document, so one such rollout anywhere in
-  the cluster stops the operator from seeing any rollout (the review reproduced it). Day 2 fixes this in the
-  operator: it reads rollouts without decoding the whole list at once and reports an undecodable one on its own.
+  the cluster stopped day 1's operator from seeing any rollout (the review reproduced it). Since day 2 the operator
+  reads and decodes each rollout on its own ("Reading rollouts", below); an undecodable one gets `Progressing` False
+  with reason `InvalidSpec` and the decoder's message on its own status, and the others carry on
+  (`TestOneUndecodableRolloutDoesNotStopTheOthers`).
 - **Label syntax.** Template label keys and values aren't checked (the schema's labels are a plain string map). A
   CEL rule using `format.qualifiedName()` and `format.labelValue()` is over the cost budget, because the map has no
-  size bound; day 2's operator checks them before building a Deployment.
+  size bound. The API server checks them when the operator creates a Deployment from the template, and the operator
+  reports that refusal on the rollout (`InvalidSpec`, `TestATemplateTheAPIServerRefuses`); the same catches anything
+  else a Deployment refuses that the CRD's schema let through.
 - **A weight written as `10.0`** (from a raw-JSON client; kubectl writes `10`) fails the increasing-weights rule
   with an evaluation error rather than being accepted.
 
@@ -129,15 +133,15 @@ Why these choices:
 |---|---|
 | `observedGeneration` | the `metadata.generation` the status describes |
 | `updateRevision` | the revision of `spec.template` (below) |
-| `stableRevision` | the revision the stable Deployment runs (day 2) |
-| `canaryRevision` | the revision under test, empty when none (day 2) |
+| `stableRevision` | the revision the stable Deployment runs (its pod template's revision label) |
+| `canaryRevision` | the revision under test, empty when none |
 | `rolledBackRevision` | the last revision rolled back, so it isn't retried until the template changes (day 3) |
-| `phase` | `Healthy`, `Progressing`, `Promoting` or `RolledBack` (day 2) |
-| `currentStep` | the index of the step in progress (day 2) |
-| `stepStartedAt` | when the current step's pods became ready and its pause began (day 2) |
-| `stableReplicas`, `canaryReplicas` | ready pods of each (day 2) |
-| `canaryWeight` | the canary's actual share of the pods, in percent, rounded down (day 2) |
-| `conditions` | `Progressing`, `Available` (day 2), `AnalysisPassing` (day 3) |
+| `phase` | `Healthy`, `Progressing`, `Promoting` or `RolledBack` (day 3) |
+| `currentStep` | the index of the step in progress (the last one during `Promoting`) |
+| `stepStartedAt` | when the current step's pods became ready and its pause began; cleared when the step ends |
+| `stableReplicas`, `canaryReplicas` | ready pods of each, as last read |
+| `canaryWeight` | the canary's actual share of the ready pods, in percent, rounded down |
+| `conditions` | `Progressing`, `Available` ("Conditions" below), `AnalysisPassing` (day 3) |
 
 **The revision** of a template is the first 16 hex digits of the SHA-256 of its JSON encoding. Go's encoder writes
 struct fields in a fixed order and map keys sorted, so the same template gets the same revision in every process.
@@ -146,7 +150,7 @@ kept: `1Gi` and `1073741824` are equal and get different revisions, so rewriting
 a rollout of what is the same template (`TestQuantityFormatIsPartOfTheRevision`). It goes on the pods as a label, so 16 hex digits
 (64 bits) also keeps it well inside the 63-character limit for label values.
 
-## The rollout (days 2 and 3)
+## The rollout (day 2; rollback is day 3's)
 
 ### Splitting the pods
 
@@ -156,7 +160,10 @@ For a step of weight `w` percent and `R = spec.replicas`:
 - `stable = R - canary`, except that a step below 100% never takes the last stable pod: if that leaves no stable pod,
   `stable = 1` and the rollout runs one pod more than `replicas` until it ends;
 - `canaryWeight = floor(100 * canary / (canary + stable))` is reported, since it isn't always `w` (with `R = 3`,
-  a 10% step runs 1 canary and 2 stable pods: 33%).
+  a 10% step runs 1 canary and 2 stable pods: 33%). It is computed from the pods that are ready.
+
+`rollout.Split` is checked against these rules for all 100,000 inputs the API allows
+(`TestSplitHoldsForEveryAllowedInput`).
 
 ### The state machine
 
@@ -167,43 +174,102 @@ stateDiagram-v2
   Progressing --> Progressing: step passed (next step)
   Progressing --> Progressing: template changed again (restart at step 0)
   Progressing --> Promoting: last step passed
-  Promoting --> Healthy: stable runs the new revision, canary at 0
-  Progressing --> RolledBack: analysis failed or deadline passed
+  Promoting --> Healthy: stable ready at the new revision, canary to 0
   Progressing --> Healthy: template changed back to the stable revision
-  RolledBack --> Progressing: template changed (a new revision)
+  Progressing --> RolledBack: deadline passed or analysis failed (day 3)
+  RolledBack --> Progressing: template changed (a new revision, day 3)
 ```
 
-1. **First apply.** There is nothing to compare a first version with, so the operator creates the stable Deployment
-   from the template at `replicas` pods, and no canary. Phase `Healthy`.
-2. **Template change.** A revision other than the stable one (and other than `rolledBackRevision`) starts a rollout:
-   the canary Deployment gets the template, step 0's split is applied. If a rollout is already in progress for
-   another revision, it restarts at step 0 with the new one; if the template goes back to the stable revision, the
-   canary is scaled to 0 and the rollout ends.
-3. **A step.** First its pods must be ready: the canary Deployment's ready, updated pods equal the step's canary
-   count. If that hasn't happened `progressDeadlineSeconds` after the step began, the rollout rolls back. Once ready,
-   the step's pause runs; during it the analysis is checked every `interval`. When the pause is over (and, with an
-   analysis, at least one check has passed since the step's pods were ready), the next step begins.
-4. **Promotion.** After the last step the stable Deployment gets the canary's template and all `replicas` pods; once
-   they are ready the canary goes to 0, `stableRevision` becomes the canary's, and the phase is `Healthy` again. The
-   canary's pods stay up until the stable's new pods are ready, so capacity never drops.
-5. **Rollback.** The canary goes to 0 pods, the stable back to `replicas`, the phase is `RolledBack`,
-   `rolledBackRevision` records the revision, and a Warning Event says why. The operator doesn't retry that revision;
-   a different template starts a new rollout.
+`rollout.Decide` is the whole state machine as one pure function: from the spec, the template's revision, the last
+status and what the operator read of its two Deployments, it returns each Deployment's target (replicas, and whether
+its pod template becomes the rollout's), the next status, the `Progressing` condition's reason and message, when to
+be woken (the end of a pause) and the Events to record. The reconciler only reads, calls it, and writes.
 
-The operator keeps no state of its own: everything it needs is in the status and the two Deployments, so a restart
-(or a new leader) carries on where the last one stopped. Each reconcile computes the desired state from what it
-reads, applies it, and asks to be requeued when the next timed event is due (the end of a pause, the next check,
-the deadline).
+1. **First apply.** There is nothing to compare a first version with, so the operator creates the stable Deployment
+   from the template at `replicas` pods, and no canary. Phase `Healthy`. The same happens if the stable Deployment is
+   deleted: the version it ran is gone with it, so the template becomes the stable version.
+2. **Template change.** A revision other than the stable's starts a rollout at step 0: `canaryRevision` records it,
+   and the canary Deployment gets the template. If a rollout is already in progress for another revision, it restarts
+   at step 0 with the new one.
+3. **A step.** The canary is scaled to the step's count first; the stable keeps the pods it has until the step's
+   canary pods are ready, and only then goes down to the step's count, so capacity doesn't drop while new pods start.
+   "Ready" is what `kubectl rollout status` waits for, with ready pods: the Deployment controller has seen the latest
+   spec (`observedGeneration`), and its updated, ready and total pods all equal its replicas. Once the step's canary
+   pods are ready, `stepStartedAt` is set and the step's pause runs from then (time spent waiting for pods doesn't
+   count, and a pod lost later doesn't restart it). When the pause is over the next step begins; a step with a 0s
+   pause passes straight through, so the stable never goes down to that step's count. Day 3 adds the analysis at the
+   end of the pause and the `progressDeadlineSeconds` rollback.
+4. **Promotion.** After the last step the stable Deployment takes the template at `replicas` pods (phase
+   `Promoting`). The operator's Deployments replace pods with `maxUnavailable: 0`, and the canary keeps its pods until
+   the stable's are all ready at the new revision; then the canary goes to 0, `stableRevision` is the new revision,
+   and the phase is `Healthy` again.
+5. **The template back to the stable's revision** mid-rollout ends the rollout (`RolloutReverted`): the stable goes
+   back to `replicas` pods, and the canary keeps its pods until the stable has them all, then goes to 0.
+
+The capacity rules, all in `Decide`, each failing the random walks (`TestRandomWalks`) when removed: the canary is
+scaled up before the stable down; the canary is kept during a promotion and after a revert until the stable is ready
+at all replicas; and **a canary with more pods than the current step's** (a restart from a later step, or a new
+rollout started while the last one's canary still drains) is neither scaled down nor given the new template until the
+stable is settled at its count. Scaling it down first would drop capacity; giving it the new template at its old
+count would send the new version more than the step's share. The random walks found that last case while `Decide`
+was being written.
+
+The operator keeps no state of its own: everything it needs is in the status (phase, `canaryRevision`,
+`currentStep`, `stepStartedAt`) and the two Deployments (the revision each runs is its pod template's revision label),
+so a restart or a new leader carries on where the last one stopped (`TestANewOperatorCarriesOn`). Each reconcile asks
+to be requeued at the end of a pause; everything else wakes it through its watches.
+
+### One reconcile
+
+1. Read the rollout from the API server as unstructured JSON and decode it ("Reading rollouts", below).
+2. Read `<name>-stable` and `<name>-canary` from the cache. One that exists but isn't controlled by this rollout is
+   someone else's: the operator leaves it alone and reports `Progressing` False, reason `DeploymentConflict`.
+3. `Decide`.
+4. **Write the Deployments**: create one the plan needs, or update its replicas, and its pod template when the plan
+   takes the template and the revision label differs. Updates carry the `resourceVersion` read, so a stale cache read
+   gets a conflict instead of undoing a newer write; a conflict ends the reconcile (the newer object is an event of its
+   own). A Deployment the API server refuses as invalid (the CRD accepted a template a Deployment can't have: a label
+   value with `!`, an invalid container name) ends it with `Progressing` False, reason `InvalidSpec`, the API
+   server's message, and a Warning Event; nothing more is written until the template changes.
+5. **Then the status**, if it changed, with the optimistic lock. The Deployments go first so that a refused
+   Deployment leaves the status describing what really runs. The other failure, a status write lost after the
+   Deployments were written, is handled in `Decide`: the one that matters is a promotion's (the stable already runs the
+   revision under test while the status still says `Progressing`), so a stable at the revision under test counts as
+   a promotion (`TestAPromotionWhoseStatusWasLost`).
+6. **Then the Events**, only if the status write succeeded: a reconcile whose write lost a conflict decides again from
+   the same last status, and would otherwise repeat them.
+
+### Reading rollouts
+
+The API server can store a rollout the typed client can't decode ("What the API server does not catch", above), and
+a typed cache decodes every rollout in one list, so one such object stopped day 1's operator for all of them. The
+operator now watches rollouts metadata-only (`builder.OnlyMetadata`) and reads each one with a GET as unstructured
+JSON, decoding it itself. The price is one GET per reconcile instead of a cache read. Deployments are read from the
+cache: the API server validated them in full.
 
 ### The objects the operator writes
 
-- Deployment `<name>-stable` and `<name>-canary`, owned by the rollout (controller reference). Their selector is
-  `{rollouts.vivekdavara.github.io/rollout: <name>, rollouts.vivekdavara.github.io/track: stable|canary}`, labels
-  only the operator sets, so the two never select each other's pods. Deployment selectors are immutable, which is
-  why the revision isn't in them; the revision label goes on the pod template.
+- Deployment `<name>-stable` and `<name>-canary`, owned by the rollout (controller reference, so deleting the rollout
+  deletes them). Their selector is `{rollouts.vivekdavara.github.io/rollout: <name>,
+  rollouts.vivekdavara.github.io/track: stable|canary}`, labels only the operator sets, so the two never select each
+  other's pods. Deployment selectors are immutable, which is why the revision isn't in them; the revision label goes
+  on the pod template. Strategy: rolling update with `maxUnavailable: 0` and `maxSurge: 25%`.
 - Pod labels added to the template: `.../rollout`, `.../track`, `.../revision`. A metric query can select
   `track="canary"` when Prometheus keeps pod labels.
-- Events on the rollout: `RolloutStarted`, `StepAdvanced`, `Promoted`, `RolledBack`, `AnalysisFailed` (days 2-3).
+- The operator compares a Deployment's template only by its revision label: a hand edit to a Deployment's pod
+  template isn't undone (a hand edit to its replicas is, at the next reconcile). The rollout's template is the way to
+  change the pods.
+- Events (events.k8s.io/v1) on the rollout: `RolloutStarted`, `StepAdvanced`, `Promoting`, `Promoted`,
+  `RolloutReverted` (Normal); `InvalidSpec`, `DeploymentConflict` (Warning). Day 3 adds `RolledBack` and
+  `AnalysisFailed`.
+
+### Conditions
+
+| Type | Status | Reasons |
+|---|---|---|
+| `Progressing` | True while a rollout runs | `WaitingForCanary` (a step's canary pods aren't all ready), `StepPaused` (its pause is running; the message says until when), `Promoting` |
+| `Progressing` | False otherwise | `Idle` (no rollout), `InvalidSpec` (undecodable, or a Deployment refused), `DeploymentConflict` |
+| `Available` | True or False | `EnoughPodsReady` or `NotEnoughPodsReady`: whether the two Deployments' ready pods add up to `replicas` |
 
 The rollout's name becomes a prefix of Deployment and pod names, so the API server limits it to 50 characters.
 
@@ -226,8 +292,11 @@ failed since the step began.
   the administrator, so a permission the rbac markers miss fails a test.
 - **The manifests are applied with kubectl**, the version envtest downloads with the API server, as the README says
   to (`config/install_test.go`).
-- **Unit tests** for the pure parts: revisions, the split, the state machine's decisions (day 2), the analysis's
-  verdicts (day 3).
+- **Unit tests** for the pure parts: revisions, the split (every allowed input), the state machine (whole rollouts
+  through a hand-simulated Deployment controller, and 3,000 seeded random walks checking capacity, the status's
+  consistency and that every walk ends `Healthy`), the analysis's verdicts (day 3).
+- **The reconcile's own mechanisms** are tested by calling `Reconcile` by hand through an interceptor client: the
+  optimistic lock (the spec changes between read and patch), and that a reconcile with nothing new writes nothing.
 - **kind** in CI on day 4: a real cluster with a real Deployment controller, one rollout that passes and one that
   fails and rolls back.
 
