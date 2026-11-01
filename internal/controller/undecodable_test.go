@@ -51,7 +51,7 @@ func createRaw(t *testing.T, ns string, obj map[string]any) {
 // catch").
 func undecodable(t *testing.T, ns string) map[string]any {
 	t.Helper()
-	m, err := runtime.DefaultUnstructuredConverter.ToUnstructured(rollout(ns, "example.com/web:1"))
+	m, err := runtime.DefaultUnstructuredConverter.ToUnstructured(newRollout(ns, "example.com/web:1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestOneUndecodableRolloutDoesNotStopTheOthers(t *testing.T) {
 		t.Fatal("the typed client decoded the bad rollout; the test no longer makes one it can't")
 	}
 
-	ro := rollout(env.Namespace(t), "example.com/web:1")
+	ro := newRollout(env.Namespace(t), "example.com/web:1")
 	if err := c.Create(ctx, ro); err != nil {
 		t.Fatal(err)
 	}

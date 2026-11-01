@@ -4,9 +4,12 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -14,20 +17,32 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	rolloutsv1alpha1 "github.com/vivekdavara/canary/api/v1alpha1"
 	"github.com/vivekdavara/canary/internal/revision"
+	"github.com/vivekdavara/canary/internal/rollout"
 )
 
-// Condition types and the reasons the operator gives (DESIGN.md, "Status").
+// Condition types and the reasons the operator gives (DESIGN.md, "Status"). The Progressing condition's other
+// reasons are the state machine's (internal/rollout).
 const (
 	ConditionProgressing = "Progressing"
+	ConditionAvailable   = "Available"
 
-	// ReasonInvalidSpec: the stored rollout can't be decoded, or its template can't be run.
+	// ReasonInvalidSpec: the stored rollout can't be decoded, or the API server refused a Deployment built from its
+	// template.
 	ReasonInvalidSpec = "InvalidSpec"
+	// ReasonDeploymentConflict: a Deployment with one of the rollout's names belongs to someone else.
+	ReasonDeploymentConflict = "DeploymentConflict"
+
+	ReasonEnoughPods      = "EnoughPodsReady"
+	ReasonNotEnoughPods   = "NotEnoughPodsReady"
+	eventActionRollout    = "Rollout"
+	eventActionValidation = "Validate"
 )
 
 // CanaryRolloutReconciler reconciles CanaryRollouts.
@@ -35,28 +50,43 @@ type CanaryRolloutReconciler struct {
 	client.Client
 	// APIReader reads each rollout straight from the API server (see Reconcile for why not from the cache).
 	APIReader client.Reader
+	// Recorder records Events on rollouts (events.k8s.io/v1).
+	Recorder events.EventRecorder
+	// Now is the clock; time.Now when nil. Tests set it.
+	Now func() time.Time
 }
 
 // New returns the reconciler for mgr.
 func New(mgr ctrl.Manager) *CanaryRolloutReconciler {
-	return &CanaryRolloutReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader()}
+	return &CanaryRolloutReconciler{
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Recorder:  mgr.GetEventRecorder("canary"),
+	}
 }
 
 // The permissions the operator needs, generated into config/rbac/role.yaml by make manifests: no more than the code
-// uses (the status is only patched). Watching Deployments needs only reading them; day 2 adds writing them, and
-// Events. --leader-elect's Lease is in config/rbac/leader_election_role.yaml, a namespaced Role.
+// uses. The status is only patched; Deployments are created and updated, never deleted (owner references let the
+// garbage collector do that); Events are created, and patched when one repeats. --leader-elect's Lease is in
+// config/rbac/leader_election_role.yaml, a namespaced Role.
 //
 // +kubebuilder:rbac:groups=rollouts.vivekdavara.github.io,resources=canaryrollouts,verbs=get;list;watch
 // +kubebuilder:rbac:groups=rollouts.vivekdavara.github.io,resources=canaryrollouts/status,verbs=patch
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
-// Reconcile brings one rollout's status up to date with its spec.
+// Reconcile moves one rollout a step on: it reads the rollout and its two Deployments, asks the state machine
+// (rollout.Decide) what comes next, makes the Deployments match, then writes the status and records Events.
 //
 // The rollout is read from the API server as unstructured JSON and decoded here, one object at a time. The API server
 // can accept a rollout the typed client can't decode (a probe port beyond int32: the CRD's copy of the pod schema
 // doesn't bound int-or-string fields), and a typed cache decodes every rollout in one list, so one such object would
 // stop the operator for all of them. The watch is metadata-only for the same reason; the price is one GET per
 // reconcile instead of a cache read.
+//
+// The Deployments are written before the status: a failed Deployment write (a template the API server refuses, a
+// conflict) then leaves the status describing what is really running. The state machine copes with the other
+// order of failure (rollout.Decide says how).
 func (r *CanaryRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	u := &unstructured.Unstructured{}
 	u.SetGroupVersionKind(rolloutsv1alpha1.GroupVersion.WithKind("CanaryRollout"))
@@ -68,31 +98,157 @@ func (r *CanaryRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &ro); err != nil {
 		return ctrl.Result{}, r.reportUndecodable(ctx, u, err)
 	}
+	// The template as the API server stored it, defaults included (internal/revision says why).
+	rev := revision.Of(&ro.Spec.Template)
+
+	stable, err := r.readDeployment(ctx, &ro, TrackStable)
+	if err == nil {
+		var canary *appsv1.Deployment
+		canary, err = r.readDeployment(ctx, &ro, TrackCanary)
+		if err == nil {
+			return r.reconcile(ctx, &ro, rev, stable, canary)
+		}
+	}
+	var notOurs errNotOurs
+	if errors.As(err, &notOurs) {
+		return ctrl.Result{}, r.reportStuck(ctx, &ro, rev, ReasonDeploymentConflict, notOurs.Error())
+	}
+	return ctrl.Result{}, err
+}
+
+func (r *CanaryRolloutReconciler) reconcile(ctx context.Context, ro *rolloutsv1alpha1.CanaryRollout, rev string, stable, canary *appsv1.Deployment) (ctrl.Result, error) {
+	plan := rollout.Decide(rollout.Input{
+		Spec:     &ro.Spec,
+		Revision: rev,
+		Status: rollout.State{
+			Phase:          ro.Status.Phase,
+			StableRevision: ro.Status.StableRevision,
+			CanaryRevision: ro.Status.CanaryRevision,
+			CurrentStep:    ro.Status.CurrentStep,
+			StepStartedAt:  ro.Status.StepStartedAt,
+		},
+		Stable: observe(stable),
+		Canary: observe(canary),
+		Now:    r.now(),
+	})
+	for _, w := range []struct {
+		track  string
+		cur    *appsv1.Deployment
+		target rollout.Target
+	}{{TrackStable, stable, plan.Stable}, {TrackCanary, canary, plan.Canary}} {
+		err := r.apply(ctx, ro, w.track, rev, w.cur, w.target)
+		switch {
+		case err == nil:
+		case apierrors.IsConflict(err) || apierrors.IsAlreadyExists(err):
+			// The cache was behind: the newer Deployment is an event of its own and brings another reconcile.
+			return ctrl.Result{}, nil
+		case apierrors.IsInvalid(err):
+			// The template passed the CRD's schema but not the Deployment's validation (a label's syntax, a
+			// container name). Nothing changes until the template does.
+			msg := fmt.Sprintf("the API server refused Deployment %s: %v", DeploymentName(ro.Name, w.track), err)
+			return ctrl.Result{}, r.reportStuck(ctx, ro, rev, ReasonInvalidSpec, msg)
+		default:
+			return ctrl.Result{}, err
+		}
+	}
 
 	want := ro.Status.DeepCopy()
 	want.ObservedGeneration = ro.Generation
-	// The template as the API server stored it, defaults included (internal/revision says why).
-	want.UpdateRevision = revision.Of(&ro.Spec.Template)
-	// A rollout that was undecodable and has been fixed loses the condition that said so.
-	if c := meta.FindStatusCondition(want.Conditions, ConditionProgressing); c != nil && c.Reason == ReasonInvalidSpec {
-		meta.RemoveStatusCondition(&want.Conditions, ConditionProgressing)
+	want.UpdateRevision = rev
+	want.Phase = plan.State.Phase
+	want.StableRevision = plan.State.StableRevision
+	want.CanaryRevision = plan.State.CanaryRevision
+	want.CurrentStep = plan.State.CurrentStep
+	want.StepStartedAt = plan.State.StepStartedAt
+	// Ready pods as read, before this reconcile's writes: the writes' effects come back as Deployment events.
+	want.StableReplicas, want.CanaryReplicas = readyOf(stable), readyOf(canary)
+	want.CanaryWeight = rollout.Weight(want.CanaryReplicas, want.StableReplicas)
+	progressing := metav1.ConditionFalse
+	if plan.Progressing() {
+		progressing = metav1.ConditionTrue
 	}
-	if equality.Semantic.DeepEqual(*want, ro.Status) {
-		return ctrl.Result{}, nil
-	}
-
-	// The patch carries the resourceVersion read above, so it fails if the object changed since: a status computed
-	// from an older spec is never written over a newer one.
-	patch := client.MergeFromWithOptions(ro.DeepCopy(), client.MergeFromWithOptimisticLock{})
-	ro.Status = *want
-	if err := r.Status().Patch(ctx, &ro, patch); err != nil {
-		if apierrors.IsConflict(err) {
-			// The change that caused the conflict is an event of its own and brings another reconcile.
-			return ctrl.Result{}, nil
-		}
+	meta.SetStatusCondition(&want.Conditions, metav1.Condition{
+		Type: ConditionProgressing, Status: progressing, Reason: plan.Reason, Message: plan.Message, ObservedGeneration: ro.Generation,
+	})
+	meta.SetStatusCondition(&want.Conditions, available(ro, want))
+	written, err := r.writeStatus(ctx, ro, want)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{}, nil
+	// Events go out once their transition is recorded: a reconcile whose status write lost a conflict decides again
+	// from the same last status and would repeat them.
+	if written {
+		for _, e := range plan.Events {
+			r.Recorder.Eventf(ro, nil, corev1.EventTypeNormal, e.Reason, eventActionRollout, "%s", e.Message)
+		}
+	}
+	// The requeue goes back even when nothing was written: the reconcile the status write itself causes finds nothing
+	// to write, and it must still ask to be woken at the pause's end.
+	return ctrl.Result{RequeueAfter: plan.RequeueAfter}, nil
+}
+
+// available is True when the ready pods of both Deployments add up to spec.replicas.
+func available(ro *rolloutsv1alpha1.CanaryRollout, st *rolloutsv1alpha1.CanaryRolloutStatus) metav1.Condition {
+	ready := st.StableReplicas + st.CanaryReplicas
+	c := metav1.Condition{
+		Type: ConditionAvailable, Status: metav1.ConditionTrue, Reason: ReasonEnoughPods, ObservedGeneration: ro.Generation,
+		Message: fmt.Sprintf("%d of %d pods ready (%d stable, %d canary)", ready, ro.Spec.Replicas, st.StableReplicas, st.CanaryReplicas),
+	}
+	if ready < ro.Spec.Replicas {
+		c.Status, c.Reason = metav1.ConditionFalse, ReasonNotEnoughPods
+	}
+	return c
+}
+
+// reportStuck records why the rollout can't go on (Progressing False with reason and message) and a Warning Event,
+// and leaves the rest of the status, and the Deployments, as they were.
+func (r *CanaryRolloutReconciler) reportStuck(ctx context.Context, ro *rolloutsv1alpha1.CanaryRollout, rev, reason, msg string) error {
+	if len(msg) > maxMessage {
+		msg = msg[:maxMessage]
+	}
+	want := ro.Status.DeepCopy()
+	want.ObservedGeneration = ro.Generation
+	want.UpdateRevision = rev
+	meta.SetStatusCondition(&want.Conditions, metav1.Condition{
+		Type: ConditionProgressing, Status: metav1.ConditionFalse, Reason: reason, Message: msg, ObservedGeneration: ro.Generation,
+	})
+	written, err := r.writeStatus(ctx, ro, want)
+	if written {
+		r.Recorder.Eventf(ro, nil, corev1.EventTypeWarning, reason, eventActionValidation, "%s", msg)
+	}
+	return err
+}
+
+// writeStatus patches the rollout's status to want, if it differs, and says whether it wrote. The patch carries the
+// resourceVersion read, so it fails if the object changed since: a status computed from an older spec is never
+// written over a newer one. A conflict is no error: the change that caused it is an event of its own.
+func (r *CanaryRolloutReconciler) writeStatus(ctx context.Context, ro *rolloutsv1alpha1.CanaryRollout, want *rolloutsv1alpha1.CanaryRolloutStatus) (bool, error) {
+	if equality.Semantic.DeepEqual(*want, ro.Status) {
+		return false, nil
+	}
+	patch := client.MergeFromWithOptions(ro.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	ro.Status = *want
+	if err := r.Status().Patch(ctx, ro, patch); err != nil {
+		if apierrors.IsConflict(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (r *CanaryRolloutReconciler) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
+}
+
+func readyOf(d *appsv1.Deployment) int32 {
+	if d == nil {
+		return 0
+	}
+	return d.Status.ReadyReplicas
 }
 
 // maxMessage bounds a condition message built from an error (the API allows 32768 bytes).

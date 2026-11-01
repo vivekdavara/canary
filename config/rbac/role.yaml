@@ -9,9 +9,18 @@ rules:
   resources:
   - deployments
   verbs:
+  - create
   - get
   - list
+  - update
   - watch
+- apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
 - apiGroups:
   - rollouts.vivekdavara.github.io
   resources:

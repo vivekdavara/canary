@@ -9,6 +9,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -56,7 +57,7 @@ func startOperator(t *testing.T) client.Client {
 	return env.Client
 }
 
-func rollout(ns, image string) *rolloutsv1alpha1.CanaryRollout {
+func newRollout(ns, image string) *rolloutsv1alpha1.CanaryRollout {
 	return &rolloutsv1alpha1.CanaryRollout{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "web"},
 		Spec: rolloutsv1alpha1.CanaryRolloutSpec{
@@ -107,7 +108,7 @@ func TestStatusFollowsTheSpec(t *testing.T) {
 	ctx := context.Background()
 	ns := testenv.Get(t).Namespace(t)
 
-	ro := rollout(ns, "example.com/web:1")
+	ro := newRollout(ns, "example.com/web:1")
 	if err := c.Create(ctx, ro); err != nil {
 		t.Fatal(err)
 	}
@@ -141,19 +142,19 @@ func TestStatusFollowsTheSpec(t *testing.T) {
 	}
 }
 
-// The reconciler writes only its own fields: what else is in the status stays.
+// The reconciler writes only its own fields: what else is in the status stays (rolledBackRevision is day 3's).
 func TestReconcileKeepsTheRestOfTheStatus(t *testing.T) {
 	c := startOperator(t)
 	ctx := context.Background()
 	ns := testenv.Get(t).Namespace(t)
 
-	ro := rollout(ns, "example.com/web:1")
+	ro := newRollout(ns, "example.com/web:1")
 	if err := c.Create(ctx, ro); err != nil {
 		t.Fatal(err)
 	}
 	key := client.ObjectKeyFromObject(ro)
 	got := eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.ObservedGeneration == 1 })
-	got.Status.StableRevision = "0123456789abcdef"
+	got.Status.RolledBackRevision = "0123456789abcdef"
 	if err := c.Status().Update(ctx, got); err != nil {
 		t.Fatal(err)
 	}
@@ -162,15 +163,15 @@ func TestReconcileKeepsTheRestOfTheStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	got = eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.ObservedGeneration == 2 })
-	if got.Status.StableRevision != "0123456789abcdef" {
-		t.Errorf("stableRevision = %q; want it kept", got.Status.StableRevision)
+	if got.Status.RolledBackRevision != "0123456789abcdef" {
+		t.Errorf("rolledBackRevision = %q; want it kept", got.Status.RolledBackRevision)
 	}
 }
 
 // A rollout deleted before its reconcile is no error.
 func TestReconcileOfAMissingRollout(t *testing.T) {
 	env := testenv.Get(t)
-	r := &CanaryRolloutReconciler{Client: env.Client, APIReader: env.Client}
+	r := &CanaryRolloutReconciler{Client: env.Client, APIReader: env.Client, Recorder: events.NewFakeRecorder(10)}
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Namespace: "default", Name: "gone"}})
 	if err != nil || res != (ctrl.Result{}) {
 		t.Errorf("Reconcile = %+v, %v; want an empty result and no error", res, err)
