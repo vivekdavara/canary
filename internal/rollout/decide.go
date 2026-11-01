@@ -203,6 +203,7 @@ func Decide(in Input) Plan {
 	if int(i) == len(in.Spec.Steps)-1 {
 		st.Phase = v1.PhasePromoting
 		st.StableRevision = rev
+		st.StepStartedAt = nil // the step is over; currentStep stays at the last one
 		return Plan{
 			Stable:  Target{Replicas: r, FromTemplate: true},
 			Canary:  Target{Replicas: c, FromTemplate: true},

@@ -139,7 +139,7 @@ func TestARolloutFromStartToPromotion(t *testing.T) {
 	w.settle()
 	w.run() // the last step passed: promotion; the stable takes the template at 4
 	w.expect(v1.PhasePromoting, 4, 2)
-	if w.stable.Revision != "r2" || w.state.StableRevision != "r2" || w.state.CanaryRevision != "r2" {
+	if w.stable.Revision != "r2" || w.state.StableRevision != "r2" || w.state.CanaryRevision != "r2" || w.state.StepStartedAt != nil || *w.state.CurrentStep != 1 {
 		t.Fatalf("stable %+v, state %+v; want the stable at r2", w.stable, w.state)
 	}
 	w.run()
