@@ -11,6 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -107,6 +108,24 @@ func poll(t *testing.T) iter.Seq[int] {
 	}
 }
 
+// edit changes the rollout at key with change and updates it, reading it again and retrying when the update
+// conflicts (the operator writes the status meanwhile), and returns it as updated.
+func edit(t *testing.T, c client.Client, key client.ObjectKey, change func(*rolloutsv1alpha1.CanaryRollout)) *rolloutsv1alpha1.CanaryRollout {
+	t.Helper()
+	var ro rolloutsv1alpha1.CanaryRollout
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := c.Get(context.Background(), key, &ro); err != nil {
+			return err
+		}
+		change(&ro)
+		return c.Update(context.Background(), &ro)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &ro
+}
+
 // eventually polls get until ok says it's done, for up to 10 seconds.
 func eventually(t *testing.T, c client.Client, key client.ObjectKey, ok func(*rolloutsv1alpha1.CanaryRollout) bool) *rolloutsv1alpha1.CanaryRollout {
 	t.Helper()
@@ -142,10 +161,9 @@ func TestStatusFollowsTheSpec(t *testing.T) {
 	first := got.Status.UpdateRevision
 
 	// A new image: a new generation and a new revision.
-	got.Spec.Template.Spec.Containers[0].Image = "example.com/web:2"
-	if err := c.Update(ctx, got); err != nil {
-		t.Fatal(err)
-	}
+	got = edit(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) {
+		r.Spec.Template.Spec.Containers[0].Image = "example.com/web:2"
+	})
 	got = eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.ObservedGeneration == 2 })
 	if want := revision.Of(&got.Spec.Template); got.Status.UpdateRevision != want || want == first {
 		t.Errorf("after the image change: updateRevision %q, first %q; want %q, a new one", got.Status.UpdateRevision, first, want)
@@ -153,10 +171,7 @@ func TestStatusFollowsTheSpec(t *testing.T) {
 
 	// A spec change that leaves the template alone moves the generation but not the revision.
 	second := got.Status.UpdateRevision
-	got.Spec.Replicas = 6
-	if err := c.Update(ctx, got); err != nil {
-		t.Fatal(err)
-	}
+	got = edit(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) { r.Spec.Replicas = 6 })
 	got = eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.ObservedGeneration == 3 })
 	if got.Status.UpdateRevision != second {
 		t.Errorf("after a replicas change: updateRevision %q; want %q kept", got.Status.UpdateRevision, second)
@@ -179,10 +194,9 @@ func TestReconcileKeepsTheRestOfTheStatus(t *testing.T) {
 	if err := c.Status().Update(ctx, got); err != nil {
 		t.Fatal(err)
 	}
-	got.Spec.Template.Spec.Containers[0].Image = "example.com/web:2"
-	if err := c.Update(ctx, got); err != nil {
-		t.Fatal(err)
-	}
+	got = edit(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) {
+		r.Spec.Template.Spec.Containers[0].Image = "example.com/web:2"
+	})
 	got = eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.ObservedGeneration == 2 })
 	if got.Status.RolledBackRevision != "0123456789abcdef" {
 		t.Errorf("rolledBackRevision = %q; want it kept", got.Status.RolledBackRevision)

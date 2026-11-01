@@ -147,15 +147,17 @@ func TestANewOperatorCarriesOn(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := client.ObjectKeyFromObject(ro)
-	got := eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.StableRevision != "" })
+	eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.StableRevision != "" })
 	markReady(t, c, ns, "web-stable")
-	got.Spec.Template.Spec.Containers[0].Image = "example.com/web:2"
-	if err := c.Update(ctx, got); err != nil {
-		t.Fatal(err)
-	}
+	edit(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) {
+		r.Spec.Template.Spec.Containers[0].Image = "example.com/web:2"
+	})
 	deploymentWhen(t, c, ns, "web-canary", func(d *appsv1.Deployment) bool { return d != nil })
 	markReady(t, c, ns, "web-canary")
 	paused := eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.StepStartedAt != nil })
+	if !paused.Status.StepStartedAt.Time.Equal(first) {
+		t.Fatalf("the first operator recorded stepStartedAt %v; want its clock's %v", paused.Status.StepStartedAt, first)
+	}
 	deploymentWhen(t, c, ns, "web-stable", func(d *appsv1.Deployment) bool { return ptr.Deref(d.Spec.Replicas, 0) == 2 })
 	stop()
 
@@ -166,18 +168,14 @@ func TestANewOperatorCarriesOn(t *testing.T) {
 	runOperatorWithClock(t, func() time.Time { return first.Add(10 * time.Minute) })
 	// The pause doubled: the new operator reconciles (a new generation) and keeps the step's start time, so the pause
 	// still ends two hours after the old operator saw the pods ready, not two hours after the restart.
-	paused.Spec.Steps[0].Pause = &metav1.Duration{Duration: 2 * time.Hour}
-	if err := c.Update(ctx, paused); err != nil {
-		t.Fatal(err)
+	doubled := edit(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) {
+		r.Spec.Steps[0].Pause = &metav1.Duration{Duration: 2 * time.Hour}
+	})
+	got := eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.ObservedGeneration == doubled.Generation })
+	if !got.Status.StepStartedAt.Time.Equal(first) || got.Status.Phase != rolloutsv1alpha1.PhaseProgressing {
+		t.Errorf("status %+v; want still paused, stepStartedAt %v kept across operators", got.Status, first)
 	}
-	got = eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.ObservedGeneration == paused.Generation })
-	if !paused.Status.StepStartedAt.Time.Equal(first) {
-		t.Fatalf("the first operator recorded stepStartedAt %v; want its clock's %v", paused.Status.StepStartedAt, first)
-	}
-	if !got.Status.StepStartedAt.Equal(paused.Status.StepStartedAt) || got.Status.Phase != rolloutsv1alpha1.PhaseProgressing {
-		t.Errorf("status %+v; want still paused, stepStartedAt %v kept across operators", got.Status, paused.Status.StepStartedAt)
-	}
-	end := paused.Status.StepStartedAt.Add(2 * time.Hour).UTC().Format(time.RFC3339)
+	end := first.Add(2 * time.Hour).UTC().Format(time.RFC3339)
 	if cond := meta.FindStatusCondition(got.Status.Conditions, ConditionProgressing); cond == nil || !strings.Contains(cond.Message, end) {
 		t.Errorf("Progressing = %+v; want paused until %s", cond, end)
 	}

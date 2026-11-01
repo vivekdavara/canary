@@ -142,10 +142,9 @@ func TestARolloutEndToEnd(t *testing.T) {
 	}
 
 	// A new image: step 1 (25% of 4) runs one canary pod, and the stable keeps its 4 until that pod is ready.
-	got.Spec.Template.Spec.Containers[0].Image = "example.com/web:2"
-	if err := c.Update(ctx, got); err != nil {
-		t.Fatal(err)
-	}
+	got = edit(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) {
+		r.Spec.Template.Spec.Containers[0].Image = "example.com/web:2"
+	})
 	got = eventually(t, c, key, phase(rolloutsv1alpha1.PhaseProgressing))
 	rev2 := revision.Of(&got.Spec.Template)
 	deploymentWhen(t, c, ns, canaryName, at(rev2, 1))
@@ -211,10 +210,9 @@ func TestAPauseEndsOnItsOwn(t *testing.T) {
 	key := client.ObjectKeyFromObject(ro)
 	got := eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.StableRevision != "" })
 	markReady(t, c, ns, "web-stable")
-	got.Spec.Template.Spec.Containers[0].Image = "example.com/web:2"
-	if err := c.Update(ctx, got); err != nil {
-		t.Fatal(err)
-	}
+	got = edit(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) {
+		r.Spec.Template.Spec.Containers[0].Image = "example.com/web:2"
+	})
 	deploymentWhen(t, c, ns, "web-canary", func(d *appsv1.Deployment) bool { return d != nil })
 	markReady(t, c, ns, "web-canary")
 	got = eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.StepStartedAt != nil })
@@ -266,10 +264,7 @@ func TestATemplateTheAPIServerRefuses(t *testing.T) {
 		t.Errorf("events %v; want an InvalidSpec Warning", reasons(t, c, ns, "web"))
 	}
 
-	got.Spec.Template.Labels["app"] = "web"
-	if err := c.Update(ctx, got); err != nil {
-		t.Fatal(err)
-	}
+	got = edit(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) { r.Spec.Template.Labels["app"] = "web" })
 	got = eventually(t, c, key, phase(rolloutsv1alpha1.PhaseHealthy))
 	deploymentWhen(t, c, ns, "web-stable", at(got.Status.StableRevision, 4))
 	if cond := meta.FindStatusCondition(got.Status.Conditions, ConditionProgressing); cond.Reason != rollout.ReasonIdle {
@@ -316,10 +311,7 @@ func TestSomeoneElsesDeploymentWithTheName(t *testing.T) {
 	}
 	// Deleting it is an event for a Deployment the rollout doesn't own, so nothing wakes the operator for this
 	// rollout; a change to the rollout does.
-	got.Annotations = map[string]string{"poke": "1"}
-	if err := c.Update(ctx, got); err != nil {
-		t.Fatal(err)
-	}
+	edit(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) { r.Annotations = map[string]string{"poke": "1"} })
 	got = eventually(t, c, key, phase(rolloutsv1alpha1.PhaseHealthy))
 	deploymentWhen(t, c, ns, "web-stable", at(got.Status.StableRevision, 4))
 }

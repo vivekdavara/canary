@@ -80,11 +80,10 @@ func TestOneUndecodableRolloutDoesNotStopTheOthers(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := client.ObjectKeyFromObject(ro)
-	got := eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.ObservedGeneration == 1 })
-	got.Spec.Template.Spec.Containers[0].Image = "example.com/web:2"
-	if err := c.Update(ctx, got); err != nil {
-		t.Fatal(err)
-	}
+	eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.ObservedGeneration == 1 })
+	edit(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) {
+		r.Spec.Template.Spec.Containers[0].Image = "example.com/web:2"
+	})
 	eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.ObservedGeneration == 2 })
 
 	cond := eventuallyCondition(t, c, client.ObjectKey{Namespace: badNS, Name: "web"}, func(st map[string]any, cond *metav1.Condition) bool {
