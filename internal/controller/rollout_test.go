@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	rolloutsv1alpha1 "github.com/vivekdavara/canary/api/v1alpha1"
 	"github.com/vivekdavara/canary/internal/revision"
@@ -351,5 +353,64 @@ func TestADeletedDeploymentComesBack(t *testing.T) {
 	got = eventually(t, c, key, phase(rolloutsv1alpha1.PhaseHealthy))
 	if got.Status.StableRevision != rev2 {
 		t.Errorf("status %+v; want the template as the stable version", got.Status)
+	}
+}
+
+// A whole rollout's writes, counted at the operator's own client: the numbers the README quotes, and a guard against a
+// reconcile that writes in a loop (every status write is itself an event that brings another reconcile). After the
+// rollout ends, two quiet seconds must pass with no write at all.
+func TestARolloutsWrites(t *testing.T) {
+	var creates, updates, statusPatches atomic.Int32
+	runOperatorWith(t, operatorOptions{funcs: &interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			creates.Add(1)
+			return c.Create(ctx, obj, opts...)
+		},
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			updates.Add(1)
+			return c.Update(ctx, obj, opts...)
+		},
+		SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			statusPatches.Add(1)
+			return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
+		},
+	}})
+	c := testenv.Get(t).Client
+	ns := testenv.Get(t).Namespace(t)
+	ro := newRollout(ns, "example.com/web:1") // 4 pods, steps of 25% and 50%, no pauses
+	if err := c.Create(context.Background(), ro); err != nil {
+		t.Fatal(err)
+	}
+	key := client.ObjectKeyFromObject(ro)
+	eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.StableRevision != "" })
+	markReady(t, c, ns, "web-stable")
+	eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.StableReplicas == 4 })
+	got := edit(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) {
+		r.Spec.Template.Spec.Containers[0].Image = "example.com/web:2"
+	})
+	rev2 := revision.Of(&got.Spec.Template)
+	deploymentWhen(t, c, ns, "web-canary", at(rev2, 1))
+	markReady(t, c, ns, "web-canary")
+	deploymentWhen(t, c, ns, "web-canary", at(rev2, 2))
+	markReady(t, c, ns, "web-canary")
+	deploymentWhen(t, c, ns, "web-stable", at(rev2, 4))
+	markReady(t, c, ns, "web-stable")
+	deploymentWhen(t, c, ns, "web-canary", at(rev2, 0))
+	markReady(t, c, ns, "web-canary")
+	eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool {
+		return r.Status.Phase == rolloutsv1alpha1.PhaseHealthy && r.Status.StableRevision == rev2 && r.Status.StableReplicas == 4 && r.Status.CanaryReplicas == 0
+	})
+
+	before := [3]int32{creates.Load(), updates.Load(), statusPatches.Load()}
+	time.Sleep(2 * time.Second)
+	if after := [3]int32{creates.Load(), updates.Load(), statusPatches.Load()}; after != before {
+		t.Fatalf("writes went on after the rollout ended: (creates, updates, status patches) %v, then %v", before, after)
+	}
+	t.Logf("a whole rollout (first apply, two steps, promotion): %d creates, %d Deployment updates, %d status patches", before[0], before[1], before[2])
+	// Creates: the two Deployments. Updates: the canary 1 -> 2, the stable's template, the canary to 0, the stable
+	// 4 -> 2 if a step's pods are ready before the next begins (with no pauses they may not be). Status: each
+	// transition and each change in ready pods, about a dozen.
+	if before[0] != 2 || before[1] > 6 || before[2] > 20 {
+		t.Errorf("(creates, updates, status patches) = %v; want 2, at most 6, at most 20", before)
 	}
 }

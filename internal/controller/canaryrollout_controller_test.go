@@ -10,11 +10,13 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/config"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
@@ -43,8 +45,30 @@ func runOperator(t *testing.T) (stop func()) {
 // runOperatorWithClock is runOperator with the reconciler's clock set (time.Now when nil).
 func runOperatorWithClock(t *testing.T, now func() time.Time) (stop func()) {
 	t.Helper()
+	return runOperatorWith(t, operatorOptions{now: now})
+}
+
+// operatorOptions change how a test's operator runs.
+type operatorOptions struct {
+	now   func() time.Time   // the reconciler's clock; time.Now when nil
+	funcs *interceptor.Funcs // when set, the manager's client goes through these (to count or fail calls)
+}
+
+func runOperatorWith(t *testing.T, opts operatorOptions) (stop func()) {
+	t.Helper()
 	env := testenv.Get(t)
+	var newClient client.NewClientFunc
+	if opts.funcs != nil {
+		newClient = func(cfg *rest.Config, o client.Options) (client.Client, error) {
+			wc, err := client.NewWithWatch(cfg, o)
+			if err != nil {
+				return nil, err
+			}
+			return interceptor.NewClient(wc, *opts.funcs), nil
+		}
+	}
 	mgr, err := ctrl.NewManager(env.OperatorConfig(t), ctrl.Options{
+		NewClient:              newClient,
 		Scheme:                 env.Scheme,
 		Metrics:                metricsserver.Options{BindAddress: "0"},
 		HealthProbeBindAddress: "0",
@@ -59,7 +83,7 @@ func runOperatorWithClock(t *testing.T, now func() time.Time) (stop func()) {
 		t.Fatal(err)
 	}
 	r := New(mgr)
-	r.Now = now
+	r.Now = opts.now
 	if err := r.SetupWithManager(mgr); err != nil {
 		t.Fatal(err)
 	}
