@@ -120,10 +120,13 @@ func Decide(in Input) Plan {
 	inRollout := last.CanaryRevision == rev && (last.Phase == v1.PhaseProgressing || last.Phase == v1.PhasePromoting)
 
 	// Promotion: the stable takes the template at all replicas, and the canary keeps its pods until the stable's
-	// are ready, so capacity never drops. A stable already at the revision under test means a promotion too: the
-	// operator writes the Deployments before the status, so a status write that failed after the stable took the
-	// template leaves the phase at Progressing.
-	if inRollout && (last.Phase == v1.PhasePromoting || stable.Revision == rev) {
+	// are ready, so capacity never drops. A stable already at the revision under test, at the last step, means a
+	// promotion too: the operator writes the Deployments before the status, so a status write that failed after the
+	// stable took the template leaves the phase at Progressing. (Earlier steps can't have promoted: there, a stable at
+	// the revision under test was recreated from the template after being deleted, and the next branch ends the
+	// rollout.)
+	lastStep := int32(len(in.Spec.Steps) - 1)
+	if inRollout && (last.Phase == v1.PhasePromoting || (stable.Revision == rev && stepIndex(last.CurrentStep, in.Spec) == lastStep)) {
 		// The steps may have changed since (they aren't part of the template): the index stays in range.
 		step := ptr(stepIndex(last.CurrentStep, in.Spec))
 		var events []Event
@@ -166,7 +169,9 @@ func Decide(in Input) Plan {
 			Reason:  ReasonIdle,
 			Message: fmt.Sprintf("no rollout in progress: the stable runs revision %s", rev),
 		}
-		if last.Phase == v1.PhaseProgressing || last.Phase == v1.PhasePromoting {
+		// The template went back to the stable's version only if the rollout was of another one (a stable recreated
+		// from the template mid-rollout runs the revision that was under test).
+		if (last.Phase == v1.PhaseProgressing || last.Phase == v1.PhasePromoting) && last.CanaryRevision != rev {
 			p.Events = []Event{{EventRolloutReverted, fmt.Sprintf("the template went back to the stable's revision %s; revision %s's rollout ended", rev, last.CanaryRevision)}}
 		}
 		return p
@@ -189,11 +194,16 @@ func Decide(in Input) Plan {
 	i := stepIndex(st.CurrentStep, in.Spec)
 	st.CurrentStep = ptr(i)
 	c, s := Split(r, in.Spec.Steps[i].Weight)
-	// A pause belongs to the pods it started with. If the canary is no longer set to this step's count and revision
-	// (the steps or replicas were edited, or a status write was lost while the template changed and changed back),
-	// the step waits for its pods again, under the capacity rules, and its pause starts over.
-	if st.StepStartedAt != nil && !(canary != nil && canary.Revision == rev && canary.Replicas == c) {
-		st.StepStartedAt = nil
+	// A pause belongs to the pods it started with. If the canary no longer runs the template's revision (a status
+	// write was lost while the template changed and changed back), or a pause still running finds the canary set to
+	// another count (the steps or replicas were edited), the step waits for its pods again, under the capacity rules,
+	// and its pause starts over. A pause already over has passed, whatever the canary's count: after a status write
+	// lost at a step advance, the canary is already at the next step's count, and the step mustn't run again.
+	if st.StepStartedAt != nil {
+		over := !in.Now.Before(st.StepStartedAt.Add(pauseOf(in.Spec.Steps[i])))
+		if canary == nil || canary.Revision != rev || (!over && canary.Replicas != c) {
+			st.StepStartedAt = nil
+		}
 	}
 	if st.StepStartedAt == nil && canary.readyAt(rev, c) {
 		st.StepStartedAt = &metav1.Time{Time: ceilSecond(in.Now)}
@@ -203,9 +213,16 @@ func Decide(in Input) Plan {
 	}
 	end := st.StepStartedAt.Add(pauseOf(in.Spec.Steps[i]))
 	if in.Now.Before(end) {
+		// The stable goes down to the step's count only while the step's canary pods are all ready: one lost
+		// mid-pause doesn't restart the pause, but a replicas edit meanwhile mustn't take the stable below what the
+		// ready pods need.
+		stableWant := s
+		if !canary.readyAt(rev, c) {
+			stableWant = max(s, stable.Replicas)
+		}
 		return Plan{
 			Canary:       Target{Replicas: c, FromTemplate: true},
-			Stable:       Target{Replicas: s},
+			Stable:       Target{Replicas: stableWant},
 			State:        st,
 			Reason:       ReasonStepPaused,
 			Message:      fmt.Sprintf("%s: pods ready, paused until %s", stepName(in.Spec, i), end.UTC().Format(time.RFC3339)),

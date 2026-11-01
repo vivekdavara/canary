@@ -22,7 +22,9 @@ type world struct {
 	state          State
 	stable, canary *Deployment
 	now            time.Time
-	events         []string // reasons, in order
+	events         []string       // reasons, in order
+	edited         bool           // the rollout in progress was edited (TestRandomWalksWithEdits)
+	pauses         map[int32]bool // the steps whose pause started in the rollout in progress, as written
 }
 
 func newWorld(t *testing.T, replicas int32, steps ...v1.Step) *world {
@@ -451,9 +453,14 @@ func TestAPromotionWhoseStatusWasLost(t *testing.T) {
 
 // Random walks with everything a user or the cluster can do mid-rollout: edit the steps or replicas, change the
 // template at any time (a new version, back to the stable's, back to the previous one), delete either Deployment,
-// and lose a status write (the Deployments written, the status not). Day 2's review found five defects in exactly
-// these moves, which the walks above never made. After every decision:
+// lose a ready pod, and lose a status write (the Deployments written, the status not). Day 2's reviews found eight
+// defects in exactly these moves, which the walks above never made. After every decision:
 //   - capacity: the decision itself never takes the ready pods below min(replicas, what was ready before it);
+//   - a pause runs only for a canary that ran the template's revision when the decision was made;
+//   - in a rollout nobody edited (no step, replicas or template change, no deletion), no step's pause (of more than
+//     0s) is started twice, as recorded in the status (round 2 found a lost write at a step advance doing that). A
+//     step with a 0s pause can run twice: when the one decision that starts and ends it loses its status write, the
+//     next one doesn't know it passed (README, limitations);
 //   - when its status was written, the status agrees with itself and with the Deployments;
 //   - and when the walk ends, pods becoming ready and time passing always reach Healthy at the template.
 func TestRandomWalksWithEdits(t *testing.T) {
@@ -464,13 +471,27 @@ func TestRandomWalksWithEdits(t *testing.T) {
 		w.run()
 		w.settle()
 		revs, prev := 1, ""
+		// Half the walks make no edits (new templates only from Healthy), so the "no step twice" check, which only
+		// holds for rollouts nobody edited, has rollouts to check.
+		edits := seed%2 == 0
 		for i := range 80 {
-			lost := false
-			switch rng.IntN(12) {
+			// A lost status write is independent of the move, so it can be the write of the decision that applied a
+			// template change, a step advance or a deletion.
+			lost, edited := rng.IntN(8) == 0, true
+			if lost {
+				census["status write lost"]++
+			}
+			move := rng.IntN(13)
+			if !edits && move >= 5 && move <= 8 && !(move == 7 && w.state.Phase == v1.PhaseHealthy) {
+				move = 0
+			}
+			switch move {
 			case 0, 1, 2:
 				w.settleSome(rng)
+				edited = false
 			case 3, 4:
 				w.now = w.now.Add(time.Duration(rng.IntN(150)) * time.Second)
+				edited = false
 			case 5:
 				census["steps edited"]++
 				w.spec.Steps = randomSteps(rng)
@@ -491,6 +512,8 @@ func TestRandomWalksWithEdits(t *testing.T) {
 				}
 				if w.state.Phase != v1.PhaseHealthy {
 					census["template changed mid-rollout"]++
+				} else {
+					edited = false // a new rollout, not an edit of one
 				}
 			case 8:
 				if rng.IntN(2) == 0 {
@@ -500,30 +523,40 @@ func TestRandomWalksWithEdits(t *testing.T) {
 					census["canary deleted"]++
 					w.canary = nil
 				}
-			case 9:
-				lost = true
-				census["status write lost"]++
+			case 10:
+				edited = false
+				if d := []*Deployment{w.stable, w.canary}[rng.IntN(2)]; d != nil && d.ReadyReplicas > 0 {
+					census["ready pod lost"]++
+					d.ReadyReplicas--
+					d.Settled = false
+				}
+			default:
+				edited = false
 			}
-			w.step(seed, i, lost)
+			w.step(seed, i, lost, edited)
 		}
 		for range 6 * (len(w.spec.Steps) + 2) {
 			w.settle()
 			w.now = w.now.Add(3 * time.Minute)
-			w.step(seed, -1, false)
+			w.step(seed, -1, false, false)
 		}
 		r := w.spec.Replicas
 		if w.state.Phase != v1.PhaseHealthy || w.stable.Revision != w.rev || replicasOf(w.canary) != 0 || w.stable.Replicas != r {
 			t.Fatalf("seed %d: ended %+v, stable %+v, canary %+v; want Healthy at %s with %d pods", seed, w.state, w.stable, w.canary, w.rev, r)
 		}
 	}
-	// The walks must actually make the moves they're for.
-	for _, move := range []string{"steps edited", "replicas changed", "template changed mid-rollout", "stable deleted", "canary deleted", "status write lost"} {
+	// The walks must actually make the moves they're for, and the no-edit ones must check rollouts.
+	census["pause starts checked in unedited rollouts"] = uneditedChecks
+	for _, move := range []string{"steps edited", "replicas changed", "template changed mid-rollout", "stable deleted", "canary deleted", "status write lost", "ready pod lost", "pause starts checked in unedited rollouts"} {
 		if census[move] < 1000 {
 			t.Errorf("%q happened %d times in the walks; want at least 1000", move, census[move])
 		}
 	}
 	t.Logf("moves: %v", census)
 }
+
+// uneditedChecks counts the pause starts the "no pause twice" check applied to (TestRandomWalksWithEdits).
+var uneditedChecks int
 
 // randomSteps is 1 to 4 strictly increasing weights with pauses of 0 to 2 minutes.
 func randomSteps(rng *rand.Rand) []v1.Step {
@@ -538,19 +571,48 @@ func randomSteps(rng *rand.Rand) []v1.Step {
 }
 
 // step decides once and applies the plan, checking capacity; with lost, the status write is dropped (the Deployments
-// were written first), otherwise the status is checked too.
-func (w *world) step(seed uint64, i int, lost bool) {
+// were written first), otherwise the status is checked too. edited says the move before it was an edit, which makes
+// the rollout in progress an edited one (w.edited, until it ends).
+func (w *world) step(seed uint64, i int, lost, edited bool) {
 	w.t.Helper()
 	before := readyOf(w.stable) + readyOf(w.canary)
 	last := w.state
+	canaryBefore := w.canary
+	if canaryBefore != nil {
+		c := *canaryBefore
+		canaryBefore = &c
+	}
+	w.edited = w.edited || edited
 	w.run()
 	if after := readyOf(w.stable) + readyOf(w.canary); after < min(w.spec.Replicas, before) {
 		w.t.Fatalf("seed %d step %d: a decision took the ready pods from %d to %d (replicas %d); stable %+v, canary %+v, state %+v, steps %+v",
 			seed, i, before, after, w.spec.Replicas, w.stable, w.canary, w.state, w.spec.Steps)
 	}
+	if w.state.StepStartedAt != nil && (canaryBefore == nil || canaryBefore.Revision != w.rev) {
+		w.t.Fatalf("seed %d step %d: a pause runs (%+v) for a canary that ran %+v when the decision was made, not %s", seed, i, w.state, canaryBefore, w.rev)
+	}
+	inRollout := func(s State) bool { return s.Phase == v1.PhaseProgressing && s.CanaryRevision == w.rev }
 	if lost {
 		w.state = last
 		return
+	}
+	if w.state.CanaryRevision != last.CanaryRevision || w.state.Phase == v1.PhaseHealthy {
+		w.pauses = nil // a new rollout, or none
+	}
+	if inRollout(w.state) && last.StepStartedAt == nil && w.state.StepStartedAt != nil && pauseOf(w.spec.Steps[*w.state.CurrentStep]) > 0 {
+		if w.pauses == nil {
+			w.pauses = map[int32]bool{}
+		}
+		if !w.edited {
+			uneditedChecks++
+			if w.pauses[*w.state.CurrentStep] {
+				w.t.Fatalf("seed %d step %d: in a rollout nobody edited, step %d's pause started a second time (%+v)", seed, i, *w.state.CurrentStep, w.state)
+			}
+		}
+		w.pauses[*w.state.CurrentStep] = true
+	}
+	if w.state.Phase == v1.PhaseHealthy {
+		w.edited = false
 	}
 	st := w.state
 	switch st.Phase {
