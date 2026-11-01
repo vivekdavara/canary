@@ -4,6 +4,7 @@ import (
 	"context"
 	"iter"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,6 +28,14 @@ func TestMain(m *testing.M) { os.Exit(testenv.Main(m)) }
 // ClusterRole's permissions), until the test ends. It returns an administrator's client for the test to act with.
 func startOperator(t *testing.T) client.Client {
 	t.Helper()
+	runOperator(t)
+	return testenv.Get(t).Client
+}
+
+// runOperator starts the reconciler as startOperator does and returns a function that stops it and waits until it
+// has (the test's end calls it too; a second call does nothing).
+func runOperator(t *testing.T) (stop func()) {
+	t.Helper()
 	env := testenv.Get(t)
 	mgr, err := ctrl.NewManager(env.OperatorConfig(t), ctrl.Options{
 		Scheme:                 env.Scheme,
@@ -48,13 +57,17 @@ func startOperator(t *testing.T) client.Client {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- mgr.Start(ctx) }()
-	t.Cleanup(func() {
-		cancel()
-		if err := <-done; err != nil {
-			t.Errorf("the manager stopped with %v", err)
-		}
-	})
-	return env.Client
+	var once sync.Once
+	stop = func() {
+		once.Do(func() {
+			cancel()
+			if err := <-done; err != nil {
+				t.Errorf("the manager stopped with %v", err)
+			}
+		})
+	}
+	t.Cleanup(stop)
+	return stop
 }
 
 func newRollout(ns, image string) *rolloutsv1alpha1.CanaryRollout {
