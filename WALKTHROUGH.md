@@ -1,7 +1,8 @@
 # Walkthrough
 
-Questions an interviewer is likely to ask about Canary, with short answers grounded in the code. Day 1 covers the
-design, the API and its validation, revisions and the test setup; later days add the rollout itself.
+Questions an interviewer is likely to ask about Canary, with short answers grounded in the code. Day 1 covered the
+design, the API and its validation, revisions and the test setup; day 2 the rollout itself (the split, the state
+machine, the reconciler's reads and writes); the analysis and rollback are day 3's.
 
 ## The idea
 
@@ -84,17 +85,114 @@ A `k8s.io/api` upgrade that adds a field without `omitempty`: every unchanged te
 every application would start a rollout. `TestRevisionIsPinned` pins one revision (I checked it with `shasum` on the
 encoded JSON), so such an upgrade fails a test instead of shipping.
 
+## The rollout
+
+**Walk me through a rollout.**
+`kubectl apply` a rollout: the operator creates `web-stable` from the template at `replicas` pods (phase `Healthy`).
+Change the image: the template's revision changes, so the operator creates `web-canary` with the new template at
+step 0's count (say 1 of 10 pods) while the stable keeps all 10. When the canary's pod is ready, the stable goes down
+to 9 and the step's pause starts. When the pause ends, the next step (say 50%: canary to 5, stable still 9 until
+those are ready, then 5). After the last step the stable takes the new template at 10 pods (`Promoting`), and once
+they're ready the canary goes to 0 and the phase is `Healthy` at the new revision. `TestARolloutEndToEnd` does
+exactly this against the API server.
+
+**Why scale the canary up before the stable down?**
+So capacity never drops. Scaling both at once would remove stable pods before the canary's replacements are ready;
+the order means the rollout runs a few pods more than `replicas` for a moment instead of a few fewer. The same rule
+shows up three more times: the canary keeps its pods during a promotion until the stable's new pods are ready, after
+a revert until the stable is back at full size, and the Deployments themselves replace pods with
+`maxUnavailable: 0`.
+
+**How do you know capacity never drops?**
+`TestRandomWalks`: 3,000 seeded walks of random actions (pods becoming ready in one Deployment or the other, time
+passing, a new template, the template going back) through `Decide` and a hand-written Deployment controller model,
+checking after every decision that the ready pods add up to at least `replicas`, that the status agrees with itself,
+and that every walk ends `Healthy` at the template. Removing any of the capacity rules fails it. It found a real hole
+while I wrote `Decide`: after a revert, a new template could start a rollout while the old canary still had pods, and
+step 0 scaled that canary straight down while the stable was still coming back. Now an oversized canary is held
+(old template, old count) until the stable is settled.
+
+**Why hold the old canary rather than give it the new template right away?**
+Giving the new version the old canary's pod count would expose it to more than step 0's share; scaling it down first
+would drop capacity. Holding the old version for the time the stable takes to come back is the only option that does
+neither.
+
+**Why is the state machine a pure function?**
+`rollout.Decide` takes the spec, the last status and what was read of the two Deployments, and returns the targets,
+the next status, the condition and the Events. With no API server in it, a whole rollout is a unit test, and so are
+thousands of random ones. The reconciler (`internal/controller`) only reads, calls `Decide`, and writes.
+
+**What state does the operator keep?**
+None of its own. The status holds the phase, the revision under test, the step and when its pause began; the
+Deployments hold which revision each runs (a label on the pod template). `TestANewOperatorCarriesOn` stops one
+operator mid-pause and starts another with a clock ten minutes later: the pause still ends from the first one's
+recorded start.
+
+**What happens when the template changes mid-rollout?**
+A new revision restarts the rollout at step 0 with it (`RolloutStarted` says which rollout it replaces). The
+template going back to the stable's revision ends the rollout instead (`RolloutReverted`): the stable goes back to all
+replicas, and the canary keeps its pods until it has them.
+
+**How is a pause timed?**
+From the moment the step's canary pods are ready (`stepStartedAt`), not from when the step began, so a slow image
+pull doesn't eat the observation window. The reconciler returns `RequeueAfter` the time left. `TestAPauseEndsOnItsOwn`
+(a real 2 s pause) found that a reconcile with nothing to write returned without that requeue: the status write
+itself causes one more reconcile, which found nothing to write and dropped the timer, so a paused step never ended
+unless something else woke the operator.
+
+**When is a Deployment "ready"?**
+When the Deployment controller has seen the latest spec (`status.observedGeneration`), and its updated, ready and
+total pods all equal its replicas: what `kubectl rollout status` waits for, with readiness. Total matters: it rules out
+old pods still around during a rolling update.
+
+**How do you compare a Deployment's template with the rollout's?**
+By the revision label the operator puts on it, not by deep equality. The API server fills defaults into a stored pod
+template (`terminationMessagePath`, `dnsPolicy`, ...), so a field-by-field comparison would always differ and the
+operator would rewrite the Deployment on every reconcile. The cost: a hand edit to a Deployment's template isn't
+undone.
+
 ## The reconciler
 
-**What does it do on day 1?**
-It reads the rollout and writes `status.observedGeneration` and `status.updateRevision`, leaving the rest of the
-status alone (`TestReconcileKeepsTheRestOfTheStatus`). If nothing changed, it writes nothing.
+**What does one reconcile do?**
+Reads the rollout (from the API server, one object), reads `<name>-stable` and `<name>-canary` (from the cache),
+calls `Decide`, writes the Deployments, then the status, then records the Events. A reconcile with nothing new writes
+nothing (`TestAReconcileWithNothingNewWritesNothing` counts the calls through an interceptor client).
+
+**Why read each rollout from the API server instead of the cache?**
+Day 1's review found that the API server stores a rollout whose probe port is beyond int32 (the CRD's copy of the pod
+schema doesn't bound int-or-string fields), the typed client can't decode it, and a typed cache decodes the whole list
+as one document: one such rollout anywhere stopped the operator for every rollout. Now the watch is metadata-only and
+`Reconcile` reads the rollout as unstructured JSON and decodes it itself; a bad one gets `InvalidSpec` on its own
+status (`TestOneUndecodableRolloutDoesNotStopTheOthers`). The price is one GET per reconcile.
+
+**Why write the Deployments before the status?**
+So the status describes what really runs: if the API server refuses a Deployment (a template it can't accept), the
+status doesn't claim a phase that never happened. The opposite failure, the status write lost after a Deployment was
+written, matters in one place: a promotion. The stable then runs the revision under test while the status still says
+`Progressing`, which would look like the template going back. `Decide` treats a stable at the revision under test as a
+promotion (`TestAPromotionWhoseStatusWasLost`).
+
+**Why are Events recorded after the status write?**
+Events come from transitions, and a transition is real once the status records it. If the status write loses a
+conflict, the next reconcile decides again from the same old status and produces the same Events; sending them only
+after a successful write sends each once.
 
 **Why the optimistic lock on the status patch?**
 A merge patch without a `resourceVersion` overwrites whatever is there. If the spec changed between the read and the
 write, an unlocked patch could record a status computed from the older spec. With
 `client.MergeFromWithOptimisticLock` the write fails with a conflict instead, and the reconciler returns without an
-error: the change that caused the conflict is an event of its own and brings another reconcile.
+error: the change that caused the conflict is an event of its own. `TestAStatusFromAnOlderSpecIsNotWritten` changes
+the spec between read and patch; removing the lock fails it. Deployment updates carry the `resourceVersion` too, so a
+stale cache read gets a conflict rather than undoing a newer write.
+
+**What if a Deployment called `web-stable` already exists?**
+If the rollout isn't its controller owner, it's someone else's: the operator leaves it alone and reports
+`DeploymentConflict` with its name (`TestSomeoneElsesDeploymentWithTheName`).
+
+**What does the API server still refuse that the CRD let through?**
+Anything a Deployment's validation catches in the pod template: a label value with `!`, an invalid container name.
+The operator reports the refusal as `InvalidSpec` with the API server's message and a Warning Event, and creates
+nothing until the template changes (`TestATemplateTheAPIServerRefuses`).
 
 **Why does `status` being a subresource matter?**
 Updates to the object can't change the status and status updates can't change the spec, and only spec changes move
@@ -106,8 +204,8 @@ Updates to the object can't change the status and status updates can't change th
 A real kube-apiserver and etcd (downloaded by `setup-envtest` into `bin/k8s`) with the CRD installed, so validation,
 defaulting, pruning, RBAC and status subresources are the real ones. It runs none of Kubernetes' own controllers: a
 Deployment never gets ReplicaSets or pods, and a deleted namespace never finishes terminating (so each test gets a
-fresh namespace, `testenv.Namespace`). From day 2 tests set Deployment status themselves; day 4 adds kind for a real
-cluster.
+fresh namespace, `testenv.Namespace`). The rollout tests play the Deployment controller's part: `markReady` writes
+the status a Deployment would have once its pods are ready. Day 4 adds kind for a real cluster.
 
 **How do you know the operator's RBAC is enough?**
 The tests run the operator as a user holding exactly `config/rbac/role.yaml`, which controller-gen generates from the
@@ -138,8 +236,8 @@ One agent, at `2694208`, 11 minutes, in its own worktree, findings as failing te
 - A template with no pod spec was accepted (`containers` was only required once `spec` existed): fixed with a CEL
   rule, tested.
 - **A probe port over int32 is accepted, and then the operator can't decode the object**, and since a list decodes
-  as one document, one such rollout in any namespace stopped the operator from reconciling every other one. Not
-  fixed on day 1: the fix is in how the operator reads rollouts (each object decoded on its own), day 2's first job.
+  as one document, one such rollout in any namespace stopped the operator from reconciling every other one. Fixed on
+  day 2: rollouts are read and decoded one at a time ("Why read each rollout from the API server", above).
 - `--leader-elect` couldn't work with the generated role (I had found and fixed it meanwhile, `f89ec6e`).
 - Template label syntax isn't checked; the CEL rule for it is over budget (DESIGN.md, "What the API server does not
   catch").
@@ -148,7 +246,8 @@ One agent, at `2694208`, 11 minutes, in its own worktree, findings as failing te
 
 It also listed six mechanisms the tests didn't notice removed; the four in the CRD (minItems on both lists, the
 metric name's maxLength, the label rule's guards) now have tests, each re-run as a mutant. The three in the
-reconciler (the optimistic lock, the no-change early return, the conflict branch) still have none.
+reconciler (the optimistic lock, the no-change early return, the conflict branch) got tests on day 2, each run as a
+mutant.
 
 ## What went wrong on day 1
 
@@ -160,3 +259,16 @@ reconciler (the optimistic lock, the no-change early return, the conflict branch
   over between tool calls. That's the case `CANARY_REQUIRE_ENVTEST` exists for.
 - `--leader-elect` was a flag with nothing behind it (above).
 - The public GitHub repository couldn't be created from the scheduled session, so CI hasn't run.
+
+## What went wrong on day 2
+
+- The first `Decide` could drop capacity after a revert followed by a new template; the random walks found it
+  ("How do you know capacity never drops?").
+- A paused step never ended on its own: the reconcile that found nothing to write dropped the requeue ("How is a
+  pause timed?").
+- Two of my test expectations in `decide_test.go` were wrong, not the code: with a 0s pause a step passes straight
+  through, so the stable never goes down to that step's count.
+- My first restart test passed with its mechanism removed. Status times are stored to the second and the test took
+  under one, so a start time reset by the new operator looked identical. Worse, I had chained the commit after the
+  mutant run, so it went in (`cdd6226`) with a message saying the mutant fails; `b4ed977` fixes the test (a fixed
+  clock per operator) and its message says the earlier one was wrong.
