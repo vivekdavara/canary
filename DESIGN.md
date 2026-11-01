@@ -223,7 +223,10 @@ to be requeued at the end of a pause; everything else wakes it through its watch
 
 1. Read the rollout from the API server as unstructured JSON and decode it ("Reading rollouts", below).
 2. Read `<name>-stable` and `<name>-canary` from the cache. One that exists but isn't controlled by this rollout is
-   someone else's: the operator leaves it alone and reports `Progressing` False, reason `DeploymentConflict`.
+   someone else's: the operator leaves it alone and reports `Progressing` False, reason `DeploymentConflict`. Besides
+   the Deployments it owns, the operator watches Deployments with a rollout's names that no rollout controls, so
+   deleting such a Deployment wakes the rollout and the conflict clears itself (`TestSomeoneElsesDeploymentWithTheName`).
+   A Deployment of the rollout's deleted by hand comes back at the next reconcile (`TestADeletedDeploymentComesBack`).
 3. `Decide`.
 4. **Write the Deployments**: create one the plan needs, or update its replicas, and its pod template when the plan
    takes the template and the revision label differs. Updates carry the `resourceVersion` read, so a stale cache read
