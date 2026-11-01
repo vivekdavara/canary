@@ -154,7 +154,10 @@ No cluster runs here (no kind locally; day 4 runs one in CI), so there are no ro
   the same time): 44 top-level tests (`go test -list '.*' ./... | grep -c ^Test`), all six packages `ok`, none
   skipped.
 - `TestRandomWalks`: 3,000 walks of 60 random actions plus a settling tail, 0.12 s
-  (`go test -run TestRandomWalks -v ./internal/rollout/`).
+  (`go test -run TestRandomWalks -v ./internal/rollout/`). `TestRandomWalksWithEdits`: 5,000 walks of 80 moves,
+0.22 s; its census (printed with `-v`) at `bdc3c33`: 49,778 lost status writes, 17,265 lost ready pods, about 15,000
+step edits and 15,000 replicas changes, 7,630 stable and 3,440 canary deletions, 3,668 template changes mid-rollout,
+and 6,014 pause starts checked in rollouts nobody edited.
 - A whole rollout of 4 pods (first apply, steps of 25% and 50% with no pauses, promotion) costs the operator **2
   creates, 3 Deployment updates and 9 status patches**, the same in three runs, and no write in the two seconds after
   it ends (`go test -run TestARolloutsWrites -v ./internal/controller/` with `KUBEBUILDER_ASSETS` set, at
@@ -197,6 +200,15 @@ each has a test now, run again as a mutant. And it named what the random walk ne
 delete a Deployment, lose a write, change the template mid-rollout): `TestRandomWalksWithEdits` does each thousands
 of times, and fails with the pause fix, the deleted-stable fix or the step clamp removed.
 
+A second agent, on the fixes only (`199d92a`, 10 minutes, `review_d2b_*`), found **a regression in my fix**: my
+first "pause belongs to its pods" rule re-ran a finished step when a step advance's status write was lost (an hour,
+in its test). Also a `replicas` cut while a canary pod was down mid-pause took the stable straight down (8 of 9
+ready), a recreated stable with a lost write looked like a lost promotion (a false `Promoting` Event), and the name
+watch missed a Deployment controlled by a rollout of another name. All fixed (`bdc3c33`, `d21c9fb`). It also showed
+why my new walk missed them: its Deployments never lost a ready pod, its pause check ran after the plan was applied
+(so it could never fail), a lost write was a move of its own, and nearly every walked rollout got edited, so nothing
+checked untouched ones. Each of those is fixed in the walk, which now fails with either of those two fixes reverted.
+
 ## What went wrong on day 2
 
 - The random walks found a capacity drop in my first `Decide`: a new rollout started while the last one's canary
@@ -229,6 +241,8 @@ build.
 
 - Day 2: no analysis, no rollback and no progress deadline yet (day 3); steps advance on their pauses alone.
 - Editing the steps or `replicas` mid-pause restarts the step's pause (its pods change).
+- A step with a 0s pause can run twice if the one decision that passes it loses its status write (DESIGN.md, "The
+  state machine"); capacity holds, it costs a pod.
 - A restart from a later step, or a new rollout right after a revert, keeps the old canary's pods (old version) until
   the stable is back at its count: capacity over speed.
 - A hand edit to a Deployment's pod template isn't undone (templates are compared by their revision label).

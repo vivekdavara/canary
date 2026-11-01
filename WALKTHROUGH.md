@@ -283,6 +283,22 @@ review said exactly that. `TestRandomWalksWithEdits` makes each of those moves t
 so a generator change that stops making one fails the test), and fails with each fix removed. The lesson is the same
 as Quarry's: ask which mutants a generator would never distinguish.
 
+**And the second review round?**
+It looked only at the fixes, and found a regression in mine: my first "pause belongs to its pods" rule cleared a
+pause whenever the canary's count differed from the step's, which is also what a lost status write at a step advance
+looks like (the canary already at the next step's count), so the step ran again. The rule now distinguishes a pause
+still running (its pods changed: start over) from one already over (the step passed). It also found the stable
+being scaled down mid-pause while a canary pod was down, and showed my walk couldn't see any of it: its Deployments
+never lost a ready pod, and its pause check ran after the plan was applied, so it could never fail. This is the
+fourth project in a row where round two found a bug in round one's fix.
+
+**Is there anything the state machine still gets wrong?**
+One known case: a step with a 0s pause, where one decision sees the pods ready and moves to the next step, and that
+decision's status write is lost. The next decision doesn't know the step passed, so it runs it again: the canary
+goes back one step once the stable is settled, then forward. Capacity holds and exposure only shrinks. The fix would
+be to record the step on the canary Deployment itself, written in the same update as its replicas; it's in the
+README's limitations.
+
 **Why does the operator need `update` on `canaryrollouts/finalizers`?**
 Its Deployments carry a controller reference with `blockOwnerDeletion: true` (`SetControllerReference` sets it), so a
 foreground delete of the rollout waits for them. The `OwnerReferencesPermissionEnforcement` admission plugin

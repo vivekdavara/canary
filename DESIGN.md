@@ -203,16 +203,22 @@ be woken (the end of a pause) and the Events to record. The reconciler only read
    straight through, so the stable never goes down to that step's count. Day 3 adds the analysis at the end of the
    pause and the `progressDeadlineSeconds` rollback.
 
-   **A pause belongs to the pods it started with.** If the canary Deployment is no longer set to the step's count
-   and the template's revision, the step waits for its pods again (under the capacity rules below) and its pause
-   starts over. That happens when the steps or `replicas` are edited mid-pause (the step's split changes), when the
-   steps are cut so the current index falls back to an earlier step, and when a status write was lost while the
-   template changed and changed back (the canary then runs the other revision). Day 2's review found each of those
-   applying the new split to both Deployments at once, or promoting on a pause that belonged to other pods.
+   **A pause belongs to the pods it started with.** If the canary no longer runs the template's revision (a status
+   write was lost while the template changed and changed back), or a pause *still running* finds the canary set to
+   another count than the step's (the steps or `replicas` were edited, or cut so the index fell back to an earlier
+   step), the step waits for its pods again (under the capacity rules below) and its pause starts over. A pause
+   already over has passed, whatever the canary's count: after a status write lost at a step advance the canary is
+   already at the next step's count, and clearing the pause then would run the step again (the second review round
+   found my first version of this rule doing exactly that). While a pause runs, the stable goes down to the step's
+   count only while the step's canary pods are all ready, so a `replicas` edit during a lost canary pod can't take
+   the stable below what the ready pods need.
 4. **Promotion.** After the last step the stable Deployment takes the template at `replicas` pods (phase
    `Promoting`). The operator's Deployments replace pods with `maxUnavailable: 0`, and the canary keeps the pods it
    has until the stable's are all ready at the new revision; then the canary goes to 0 and the phase is `Healthy`
-   again. `currentStep` stays at the last step (kept in range if the steps are cut meanwhile).
+   again. `currentStep` stays at the last step (kept in range if the steps are cut meanwhile). A stable already at
+   the revision under test while the status still says `Progressing` at the last step is a promotion whose status
+   write was lost, and is carried on as one (with its lost `Promoting` Event); at an earlier step it can only be a
+   stable recreated from the template after being deleted, and the rollout simply ends.
 5. **The template back to the stable's revision** mid-rollout ends the rollout (`RolloutReverted`): the stable goes
    back to `replicas` pods, and the canary keeps its pods until the stable has them all, then goes to 0.
 
@@ -224,7 +230,15 @@ stable is settled at its count. Scaling it down first would drop capacity; givin
 count would send the new version more than the step's share. The random walks found that last case while `Decide`
 was being written. A second walk, `TestRandomWalksWithEdits`, makes the moves the first never did (editing steps
 and `replicas`, changing the template mid-rollout, deleting either Deployment, losing a status write), each
-thousands of times, and checks that no decision takes the ready pods below `min(replicas, what was ready)`.
+thousands of times, also loses ready pods and loses status writes independently of the move, and checks that no
+decision takes the ready pods below `min(replicas, what was ready)`, that a pause only runs for a canary that ran the
+template's revision, and (in the half of the walks that make no edits) that no step's pause starts twice.
+
+One case it allows, on purpose: a step with a 0s pause whose single decision (pods ready, pause over, next step)
+loses its status write runs again. The next decision can't tell that the step passed (the status never recorded
+its start), so the canary goes back to the step's count once the stable is settled, then forward again. Capacity
+holds and the new version's share only shrinks; it costs a pod. Fixing it would mean recording the step on the
+canary Deployment, written with its replicas.
 
 The operator keeps no state of its own: everything it needs is in the status (phase, `canaryRevision`,
 `currentStep`, `stepStartedAt`) and the two Deployments (the revision each runs is its pod template's revision label),
