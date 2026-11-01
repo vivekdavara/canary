@@ -220,6 +220,11 @@ annotation (`rollouts.vivekdavara.github.io/promoted-revision`) in the same upda
 guessed. While fixing it I found that rounding pause starts up had made a 0s pause wait up to a second (a whole
 rollout went from 3 to 5 Deployment updates); a 0s pause is over at once again.
 
+A fourth agent, on `940742f` only (8 minutes), found the promotion mark and the 0s pause sound, and one case where
+my new comment was wrong: a lost advance followed by a `replicas` increase leaves the canary with *fewer* pods than
+the step now needs, so the step's pause runs again. Low severity (a lost write and an edit together; capacity
+holds); documented under limitations with the 0s case, which has the same fix, and its test parked for day 3.
+
 ## What went wrong on day 2
 
 - The random walks found a capacity drop in my first `Decide`: a new rollout started while the last one's canary
@@ -252,8 +257,10 @@ build.
 
 - Day 2: no analysis, no rollback and no progress deadline yet (day 3); steps advance on their pauses alone.
 - Editing the steps or `replicas` mid-pause restarts the step's pause (its pods change).
-- A step with a 0s pause can run twice if the one decision that passes it loses its status write (DESIGN.md, "The
-  state machine"); capacity holds, it costs a pod.
+- A status write lost at a step advance can make the step run again in two cases: the step's pause was 0s (the one
+  decision that passed it is the lost one), or `replicas` went up before the next reconcile (the canary then has
+  fewer pods than the step now needs, which looks like an edit). Capacity holds; it costs a pod, or a second pause.
+  Recording the step on the canary Deployment, written with its replicas, would fix both (day 3).
 - A restart from a later step, or a new rollout right after a revert, keeps the old canary's pods (old version) until
   the stable is back at its count: capacity over speed.
 - A hand edit to a Deployment's pod template isn't undone (templates are compared by their revision label).

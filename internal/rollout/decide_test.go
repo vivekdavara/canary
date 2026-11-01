@@ -58,11 +58,8 @@ func apply(d *Deployment, t Target, rev string) *Deployment {
 	case d == nil && !t.FromTemplate:
 		return nil
 	case d == nil:
-		d := &Deployment{Revision: rev, Replicas: t.Replicas}
-		if t.Promote {
-			d.PromotedRevision = rev
-		}
-		return d
+		// As in the operator, a created Deployment carries no promotion mark.
+		return &Deployment{Revision: rev, Replicas: t.Replicas}
 	}
 	next := *d
 	// A template change replaces pods one at a time, a new one ready before an old one goes (the operator's

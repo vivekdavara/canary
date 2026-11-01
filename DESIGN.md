@@ -240,11 +240,12 @@ thousands of times, also loses ready pods and loses status writes independently 
 decision takes the ready pods below `min(replicas, what was ready)`, that a pause only runs for a canary that ran the
 template's revision, and (in the half of the walks that make no edits) that no step's pause starts twice.
 
-One case it allows, on purpose: a step with a 0s pause whose single decision (pods ready, pause over, next step)
-loses its status write runs again. The next decision can't tell that the step passed (the status never recorded
-its start), so the canary goes back to the step's count once the stable is settled, then forward again. Capacity
-holds and the new version's share only shrinks; it costs a pod. Fixing it would mean recording the step on the
-canary Deployment, written with its replicas.
+Two cases it allows, on purpose, both a status write lost at a step advance: a step with a 0s pause whose single
+decision (pods ready, pause over, next step) loses its write runs again, since the next decision can't tell the step
+passed (the status never recorded its start); and a lost advance followed by a `replicas` increase leaves the canary
+with fewer pods than the step now needs, which looks like an edit, so the step's pause runs again (the fourth review
+round). Capacity holds in both and the new version's share only shrinks; it costs a pod or a second pause. Fixing
+them means recording the step on the canary Deployment, written with its replicas (day 3).
 
 The operator keeps no state of its own: everything it needs is in the status (phase, `canaryRevision`,
 `currentStep`, `stepStartedAt`) and the two Deployments (the revision each runs is its pod template's revision label),

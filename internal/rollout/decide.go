@@ -202,9 +202,12 @@ func Decide(in Input) Plan {
 	// write was lost while the template changed and changed back), or is set to another count than the step's (the
 	// steps or replicas were edited), the step waits for its pods again, under the capacity rules, and its pause
 	// starts over. One exception: a pause already over, with the canary set to *more* pods than the step's. That is
-	// a status write lost at a step advance (weights strictly increase, so the next step's count is never lower),
-	// and the step mustn't run again. A canary set to fewer pods is never that: a raised weight or replicas edited
-	// in during the pause (an edit can also make a running pause over at once), so the new share waits to be seen.
+	// what a status write lost at a step advance leaves (weights strictly increase, so the next step's count is never
+	// lower), and the step mustn't run again. A canary set to fewer pods usually means a raised weight or replicas
+	// edited in during the pause (an edit can also make a running pause over at once), so the new share waits to be
+	// seen. Not always: a lost advance followed by a replicas increase also leaves fewer pods than the step now needs,
+	// and that step's pause then runs again (README, limitations; recording the step on the canary would tell them
+	// apart).
 	if st.StepStartedAt != nil {
 		over := pauseOver(st.StepStartedAt, in.Spec.Steps[i], in.Now)
 		if canary == nil || canary.Revision != rev || (canary.Replicas != c && !(over && canary.Replicas > c)) {
