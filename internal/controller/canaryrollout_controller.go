@@ -320,18 +320,20 @@ func (r *CanaryRolloutReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// rolloutNamedFor maps a Deployment called <name>-stable or <name>-canary that no CanaryRollout controls to rollout
-// <name> in its namespace, if one exists (checked in the metadata cache the rollout watch already keeps, so other
-// Deployments cost no request).
+// rolloutNamedFor maps a Deployment called <name>-stable or <name>-canary to rollout <name> in its namespace, if one
+// exists (checked in the metadata cache the rollout watch already keeps, so other Deployments cost no request) and
+// doesn't control it (Owns handles those). A Deployment controlled by a rollout of another name counts: it's in the
+// way of rollout <name> as much as anyone's.
 func (r *CanaryRolloutReconciler) rolloutNamedFor(ctx context.Context, d client.Object) []reconcile.Request {
-	if ref := metav1.GetControllerOf(d); ref != nil && ref.Kind == "CanaryRollout" && strings.HasPrefix(ref.APIVersion, rolloutsv1alpha1.GroupVersion.Group+"/") {
-		return nil // Owns handles it
-	}
 	name, ok := strings.CutSuffix(d.GetName(), "-"+TrackStable)
 	if !ok {
 		if name, ok = strings.CutSuffix(d.GetName(), "-"+TrackCanary); !ok {
 			return nil
 		}
+	}
+	if ref := metav1.GetControllerOf(d); ref != nil && ref.Kind == "CanaryRollout" && ref.Name == name &&
+		strings.HasPrefix(ref.APIVersion, rolloutsv1alpha1.GroupVersion.Group+"/") {
+		return nil
 	}
 	key := client.ObjectKey{Namespace: d.GetNamespace(), Name: name}
 	ro := &metav1.PartialObjectMetadata{}
