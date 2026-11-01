@@ -179,9 +179,12 @@ func TestARolloutEndToEnd(t *testing.T) {
 	deploymentWhen(t, c, ns, canaryName, at(rev2, 2))
 	eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return ptr.Deref(r.Status.CurrentStep, -1) == 1 })
 
-	// Those ready: the last step passed. The stable takes the new template at 4 pods; the canary keeps its 2.
+	// Those ready: the last step passed. The stable takes the new template at 4 pods, marked as promoted to it in the
+	// same write; the canary keeps its 2.
 	markReady(t, c, ns, canaryName)
-	deploymentWhen(t, c, ns, stableName, at(rev2, 4))
+	if d := deploymentWhen(t, c, ns, stableName, at(rev2, 4)); d.Annotations[AnnotationPromotedRevision] != rev2 {
+		t.Errorf("the promoted stable's annotations %v; want %s=%s", d.Annotations, AnnotationPromotedRevision, rev2)
+	}
 	got = eventually(t, c, key, phase(rolloutsv1alpha1.PhasePromoting))
 	if d := deploymentWhen(t, c, ns, canaryName, func(d *appsv1.Deployment) bool { return d != nil }); ptr.Deref(d.Spec.Replicas, 0) != 2 {
 		t.Errorf("canary at %d pods during the promotion; want its 2 kept", ptr.Deref(d.Spec.Replicas, 0))

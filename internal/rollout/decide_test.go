@@ -58,13 +58,20 @@ func apply(d *Deployment, t Target, rev string) *Deployment {
 	case d == nil && !t.FromTemplate:
 		return nil
 	case d == nil:
-		return &Deployment{Revision: rev, Replicas: t.Replicas}
+		d := &Deployment{Revision: rev, Replicas: t.Replicas}
+		if t.Promote {
+			d.PromotedRevision = rev
+		}
+		return d
 	}
 	next := *d
 	// A template change replaces pods one at a time, a new one ready before an old one goes (the operator's
 	// Deployments don't let pods be unavailable), so the ready count holds; scaling down removes ready pods at once.
 	if t.FromTemplate && d.Revision != rev {
 		next.Revision, next.Settled = rev, false
+	}
+	if t.Promote {
+		next.PromotedRevision = rev
 	}
 	if d.Replicas != t.Replicas {
 		next.Replicas, next.Settled = t.Replicas, false
@@ -630,4 +637,59 @@ func (w *world) step(seed uint64, i int, lost, edited bool) {
 	default:
 		w.t.Fatalf("seed %d step %d: phase %q", seed, i, st.Phase)
 	}
+}
+
+// A 0s pause is over at once, even though pause starts are rounded up to the second: the next step begins in the same
+// decision, and the stable isn't scaled down for the step it passed through.
+func TestAZeroPauseIsOverAtOnce(t *testing.T) {
+	w := newWorld(t, 4, step(25, 0), step(50, time.Hour))
+	w.now = w.now.Add(500 * time.Millisecond)
+	w.run()
+	w.settle()
+	w.rev = "r2"
+	w.run()
+	w.settle()
+	p := w.run()
+	if *w.state.CurrentStep != 1 || p.Reason != ReasonWaitingForCanary {
+		t.Fatalf("state %+v, plan %+v; want step 1 at once", w.state, p)
+	}
+	w.expect(v1.PhaseProgressing, 4, 2)
+}
+
+// While a pause runs and a canary pod is down, the stable isn't scaled down; but a replicas increase still raises it
+// to the step's new count (11 -> 12 at 25%: the canary stays 3, the stable 8 -> 9).
+func TestAReplicasIncreaseMidPauseWithACanaryPodDown(t *testing.T) {
+	w := newWorld(t, 11, step(25, time.Hour))
+	w.run()
+	w.settle()
+	w.rev = "r2"
+	w.run()
+	w.settle()
+	w.run()
+	w.expect(v1.PhaseProgressing, 8, 3)
+	w.canary.ReadyReplicas, w.canary.Settled = 2, false
+	w.spec.Replicas = 12
+	if p := w.run(); p.Reason != ReasonStepPaused {
+		t.Fatalf("plan %+v; want still paused", p)
+	}
+	w.expect(v1.PhaseProgressing, 9, 3)
+}
+
+// A stable recreated from the template mid-rollout runs the revision under test, so the rollout ends without a
+// RolloutReverted (the template didn't go back), even when the recreating decision's status write is lost.
+func TestARecreatedStableIsNotARevert(t *testing.T) {
+	w := newWorld(t, 4, step(25, 0), step(50, time.Hour))
+	w.run()
+	w.settle()
+	w.rev = "r2"
+	w.run()
+	w.stable = nil
+	last := w.state
+	w.run()
+	w.state, w.events = last, nil // the write lost
+	w.run()
+	if len(w.events) != 0 {
+		t.Fatalf("events %v; want none: the template didn't go back", w.events)
+	}
+	w.expect(v1.PhaseHealthy, 4, 1)
 }

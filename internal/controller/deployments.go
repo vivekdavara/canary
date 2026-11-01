@@ -24,6 +24,10 @@ const (
 	LabelRollout  = rolloutsv1alpha1.LabelPrefix + "rollout"
 	LabelTrack    = rolloutsv1alpha1.LabelPrefix + "track"
 	LabelRevision = rolloutsv1alpha1.LabelPrefix + "revision"
+	// AnnotationPromotedRevision on the stable Deployment names the revision a promotion gave it, written in the same
+	// update as its template, so a promotion whose status write was lost is told apart from a stable recreated from
+	// the template (rollout.Deployment.PromotedRevision).
+	AnnotationPromotedRevision = rolloutsv1alpha1.LabelPrefix + "promoted-revision"
 
 	TrackStable = "stable"
 	TrackCanary = "canary"
@@ -63,9 +67,10 @@ func observe(d *appsv1.Deployment) *rollout.Deployment {
 	}
 	want := ptr.Deref(d.Spec.Replicas, 1)
 	return &rollout.Deployment{
-		Revision:      d.Spec.Template.Labels[LabelRevision],
-		Replicas:      want,
-		ReadyReplicas: d.Status.ReadyReplicas,
+		Revision:         d.Spec.Template.Labels[LabelRevision],
+		PromotedRevision: d.Annotations[AnnotationPromotedRevision],
+		Replicas:         want,
+		ReadyReplicas:    d.Status.ReadyReplicas,
 		// What `kubectl rollout status` waits for, with ready pods: the controller has seen the latest spec, and every
 		// pod it counts runs the current template and is ready.
 		Settled: d.Status.ObservedGeneration >= d.Generation &&
@@ -135,6 +140,12 @@ func (r *CanaryRolloutReconciler) apply(ctx context.Context, ro *rolloutsv1alpha
 	}
 	if t.FromTemplate && cur.Spec.Template.Labels[LabelRevision] != rev {
 		next.Spec.Template, changed = podTemplate(ro, track, rev), true
+	}
+	if t.Promote && cur.Annotations[AnnotationPromotedRevision] != rev {
+		if next.Annotations == nil {
+			next.Annotations = map[string]string{}
+		}
+		next.Annotations[AnnotationPromotedRevision], changed = rev, true
 	}
 	if !changed {
 		return nil

@@ -48,6 +48,11 @@ func TestObserveSettled(t *testing.T) {
 	if observe(nil) != nil {
 		t.Error("observe(nil) isn't nil")
 	}
+	promoted := d(1, 1, 4, 4, 4, 4)
+	promoted.Annotations = map[string]string{AnnotationPromotedRevision: "r1"}
+	if got := observe(promoted).PromotedRevision; got != "r1" {
+		t.Errorf("PromotedRevision = %q; want the annotation's r1", got)
+	}
 }
 
 // rolloutNamedFor, case by case, against the API server's rollouts (web and a-stable exist; nothing else does).

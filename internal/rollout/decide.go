@@ -20,6 +20,9 @@ type Deployment struct {
 	// Settled says the Deployment controller has caught up with the spec: status.observedGeneration is current, and
 	// all Replicas pods run the current template and are ready, with no others left.
 	Settled bool
+	// PromotedRevision is the revision a promotion gave the stable, written with its template; empty for a stable
+	// created from the template (a first apply, or a deleted stable recreated).
+	PromotedRevision string
 }
 
 // readyAt says d exists and is settled at n pods of revision rev.
@@ -56,6 +59,9 @@ type Target struct {
 	// template replaced if its revision differs. Otherwise its template is left as it is, and a missing one isn't
 	// created.
 	FromTemplate bool
+	// Promote marks the stable as promoted to the template's revision (Deployment.PromotedRevision), in the same
+	// write as its template.
+	Promote bool
 }
 
 // Event is an Event to record on the rollout.
@@ -120,13 +126,11 @@ func Decide(in Input) Plan {
 	inRollout := last.CanaryRevision == rev && (last.Phase == v1.PhaseProgressing || last.Phase == v1.PhasePromoting)
 
 	// Promotion: the stable takes the template at all replicas, and the canary keeps its pods until the stable's
-	// are ready, so capacity never drops. A stable already at the revision under test, at the last step, means a
-	// promotion too: the operator writes the Deployments before the status, so a status write that failed after the
-	// stable took the template leaves the phase at Progressing. (Earlier steps can't have promoted: there, a stable at
-	// the revision under test was recreated from the template after being deleted, and the next branch ends the
-	// rollout.)
-	lastStep := int32(len(in.Spec.Steps) - 1)
-	if inRollout && (last.Phase == v1.PhasePromoting || (stable.Revision == rev && stepIndex(last.CurrentStep, in.Spec) == lastStep)) {
+	// are ready, so capacity never drops. A stable marked as promoted to the revision under test means a promotion
+	// too: the operator writes the Deployments before the status, so a status write that failed after the stable
+	// took the template leaves the phase at Progressing. The mark, not a guess from the step, tells such a stable from
+	// one recreated from the template after being deleted (the next branch ends that rollout).
+	if inRollout && (last.Phase == v1.PhasePromoting || stable.PromotedRevision == rev) {
 		// The steps may have changed since (they aren't part of the template): the index stays in range.
 		step := ptr(stepIndex(last.CurrentStep, in.Spec))
 		var events []Event
@@ -145,7 +149,7 @@ func Decide(in Input) Plan {
 			}
 		}
 		return Plan{
-			Stable:  Target{Replicas: r, FromTemplate: true},
+			Stable:  Target{Replicas: r, FromTemplate: true, Promote: true},
 			Canary:  Target{Replicas: replicasOf(canary)},
 			State:   State{Phase: v1.PhasePromoting, StableRevision: rev, CanaryRevision: rev, CurrentStep: step},
 			Reason:  ReasonPromoting,
@@ -195,13 +199,15 @@ func Decide(in Input) Plan {
 	st.CurrentStep = ptr(i)
 	c, s := Split(r, in.Spec.Steps[i].Weight)
 	// A pause belongs to the pods it started with. If the canary no longer runs the template's revision (a status
-	// write was lost while the template changed and changed back), or a pause still running finds the canary set to
-	// another count (the steps or replicas were edited), the step waits for its pods again, under the capacity rules,
-	// and its pause starts over. A pause already over has passed, whatever the canary's count: after a status write
-	// lost at a step advance, the canary is already at the next step's count, and the step mustn't run again.
+	// write was lost while the template changed and changed back), or is set to another count than the step's (the
+	// steps or replicas were edited), the step waits for its pods again, under the capacity rules, and its pause
+	// starts over. One exception: a pause already over, with the canary set to *more* pods than the step's. That is
+	// a status write lost at a step advance (weights strictly increase, so the next step's count is never lower),
+	// and the step mustn't run again. A canary set to fewer pods is never that: a raised weight or replicas edited
+	// in during the pause (an edit can also make a running pause over at once), so the new share waits to be seen.
 	if st.StepStartedAt != nil {
-		over := !in.Now.Before(st.StepStartedAt.Add(pauseOf(in.Spec.Steps[i])))
-		if canary == nil || canary.Revision != rev || (!over && canary.Replicas != c) {
+		over := pauseOver(st.StepStartedAt, in.Spec.Steps[i], in.Now)
+		if canary == nil || canary.Revision != rev || (canary.Replicas != c && !(over && canary.Replicas > c)) {
 			st.StepStartedAt = nil
 		}
 	}
@@ -212,7 +218,7 @@ func Decide(in Input) Plan {
 		return waitForCanary(in, st, i, events)
 	}
 	end := st.StepStartedAt.Add(pauseOf(in.Spec.Steps[i]))
-	if in.Now.Before(end) {
+	if !pauseOver(st.StepStartedAt, in.Spec.Steps[i], in.Now) {
 		// The stable goes down to the step's count only while the step's canary pods are all ready: one lost
 		// mid-pause doesn't restart the pause, but a replicas edit meanwhile mustn't take the stable below what the
 		// ready pods need.
@@ -237,7 +243,7 @@ func Decide(in Input) Plan {
 		st.StableRevision = rev
 		st.StepStartedAt = nil // the step is over; currentStep stays at the last one
 		return Plan{
-			Stable:  Target{Replicas: r, FromTemplate: true},
+			Stable:  Target{Replicas: r, FromTemplate: true, Promote: true},
 			Canary:  Target{Replicas: replicasOf(canary)},
 			State:   st,
 			Reason:  ReasonPromoting,
@@ -276,6 +282,13 @@ func waitForCanary(in Input, st State, i int32, events []Event) Plan {
 		Message: msg,
 		Events:  events,
 	}
+}
+
+// pauseOver says a step's pause that started at start has ended by now. A 0s pause is over at once (its start, rounded
+// up to the second, may be a moment ahead of now).
+func pauseOver(start *metav1.Time, s v1.Step, now time.Time) bool {
+	pause := pauseOf(s)
+	return pause == 0 || !now.Before(start.Add(pause))
 }
 
 // stepName is "step 2 of 3 (50%)" for index 1 of three steps.
