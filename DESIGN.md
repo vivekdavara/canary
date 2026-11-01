@@ -204,21 +204,27 @@ be woken (the end of a pause) and the Events to record. The reconciler only read
    pause and the `progressDeadlineSeconds` rollback.
 
    **A pause belongs to the pods it started with.** If the canary no longer runs the template's revision (a status
-   write was lost while the template changed and changed back), or a pause *still running* finds the canary set to
-   another count than the step's (the steps or `replicas` were edited, or cut so the index fell back to an earlier
-   step), the step waits for its pods again (under the capacity rules below) and its pause starts over. A pause
-   already over has passed, whatever the canary's count: after a status write lost at a step advance the canary is
-   already at the next step's count, and clearing the pause then would run the step again (the second review round
-   found my first version of this rule doing exactly that). While a pause runs, the stable goes down to the step's
+   write was lost while the template changed and changed back), or is set to another count than the step's (the
+   steps or `replicas` were edited, or cut so the index fell back to an earlier step), the step waits for its pods
+   again (under the capacity rules below) and its pause starts over. One exception: a pause already over with the
+   canary set to *more* pods than the step's. That is what a status write lost at a step advance leaves (the canary
+   already at the next step's count; weights strictly increase, so never fewer), and the step mustn't run again. A
+   canary set to fewer pods means a raised weight or more `replicas`, so the new share waits to be seen even if the
+   edit made the pause over at once. The review rounds found both of my earlier versions of this rule wrong: the
+   first re-ran finished steps, the second let an edit skip a raised weight. A 0s pause is over at once (the start's
+   rounding doesn't make it wait). While a pause runs, the stable goes down to the step's
    count only while the step's canary pods are all ready, so a `replicas` edit during a lost canary pod can't take
    the stable below what the ready pods need.
 4. **Promotion.** After the last step the stable Deployment takes the template at `replicas` pods (phase
    `Promoting`). The operator's Deployments replace pods with `maxUnavailable: 0`, and the canary keeps the pods it
    has until the stable's are all ready at the new revision; then the canary goes to 0 and the phase is `Healthy`
-   again. `currentStep` stays at the last step (kept in range if the steps are cut meanwhile). A stable already at
-   the revision under test while the status still says `Progressing` at the last step is a promotion whose status
-   write was lost, and is carried on as one (with its lost `Promoting` Event); at an earlier step it can only be a
-   stable recreated from the template after being deleted, and the rollout simply ends.
+   again. `currentStep` stays at the last step (kept in range if the steps are cut meanwhile). The promotion marks the
+   stable with the annotation `rollouts.vivekdavara.github.io/promoted-revision: <revision>`, in the same update as
+   its template. A stable so marked for the revision under test while the status still says `Progressing` is a
+   promotion whose status write was lost, and is carried on as one (with its lost `Promoting` Event). A stable at
+   that revision without the mark was recreated from the template after being deleted, and the rollout simply ends
+   (no `RolloutReverted`: the template didn't go back). The mark replaced a guess from the step index, which the
+   third review round showed wrong both ways.
 5. **The template back to the stable's revision** mid-rollout ends the rollout (`RolloutReverted`): the stable goes
    back to `replicas` pods, and the canary keeps its pods until the stable has them all, then goes to 0.
 

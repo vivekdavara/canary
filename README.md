@@ -160,9 +160,10 @@ step edits and 15,000 replicas changes, 7,630 stable and 3,440 canary deletions,
 and 6,014 pause starts checked in rollouts nobody edited.
 - A whole rollout of 4 pods (first apply, steps of 25% and 50% with no pauses, promotion) costs the operator **2
   creates, 3 Deployment updates and 9 status patches**, the same in three runs, and no write in the two seconds after
-  it ends (`go test -run TestARolloutsWrites -v ./internal/controller/` with `KUBEBUILDER_ASSETS` set, at
-  `951022f`; the test counts at the operator's own client). The stable never got a separate 4 -> 3 update: with no
-  pause, step 2 began as soon as step 1's pod was ready.
+  it ends (`go test -run TestARolloutsWrites -v ./internal/controller/` with `KUBEBUILDER_ASSETS` set, at `951022f`
+  and again at `940742f`; the test counts at the operator's own client). The stable never got a separate 4 -> 3
+  update: with no pause, step 2 began as soon as step 1's pod was ready. Between `eeb67e3` and `940742f` the same
+  rollout cost 5 updates and 11 patches, because the rounded pause start made 0s pauses wait (see the review).
 - The CRD is unchanged from day 1: 636,521 bytes with descriptions.
 
 ## Review of day 1
@@ -208,6 +209,15 @@ watch missed a Deployment controlled by a rollout of another name. All fixed (`b
 why my new walk missed them: its Deployments never lost a ready pod, its pause check ran after the plan was applied
 (so it could never fail), a lost write was a move of its own, and nearly every walked rollout got edited, so nothing
 checked untouched ones. Each of those is fixed in the walk, which now fails with either of those two fixes reverted.
+
+A third agent, on round 2's fixes only (`d21c9fb`, 6 minutes, `review_d2c_*`), found **two more regressions in
+them**: keeping a finished pause whatever the canary's count let a steps edit skip a raised weight (the 50% share
+never seen), and guessing a lost promotion from the step index was wrong both ways (a stable recreated at the last
+step looked promoted; a lost promotion followed by an added step was never reported). Fixed in `940742f`: a finished
+pause is kept only when the canary has more pods than the step's, and the stable a promotion writes is marked with an
+annotation (`rollouts.vivekdavara.github.io/promoted-revision`) in the same update, so a lost promotion is known, not
+guessed. While fixing it I found that rounding pause starts up had made a 0s pause wait up to a second (a whole
+rollout went from 3 to 5 Deployment updates); a 0s pause is over at once again.
 
 ## What went wrong on day 2
 

@@ -292,6 +292,19 @@ being scaled down mid-pause while a canary pod was down, and showed my walk coul
 never lost a ready pod, and its pause check ran after the plan was applied, so it could never fail. This is the
 fourth project in a row where round two found a bug in round one's fix.
 
+**And the third?**
+Two more regressions, in round two's fixes. Keeping a finished pause "whatever the canary's count" let a steps edit
+skip a raised weight, because the edit itself can make a running pause finished. And I had guessed "lost promotion"
+from the step index, which was wrong both ways. The fixes: a finished pause is kept only when the canary has *more*
+pods than the step's (weights strictly increase, so that's exactly a lost advance), and a promotion now marks the
+stable with an annotation in the same write as its template, so the next decision knows rather than guesses. Three
+rounds, each finding bugs in the last one's fixes; the last two found nothing in code written before the reviews.
+
+**Why an annotation rather than more status?**
+The status write is the one that can be lost; the mark has to travel with the Deployment write it describes. The
+operator writes the Deployments first, so whatever it needs to recognise later about a Deployment write belongs on
+that Deployment. The same idea would fix the one known case below (the step recorded on the canary Deployment).
+
 **Is there anything the state machine still gets wrong?**
 One known case: a step with a 0s pause, where one decision sees the pods ready and moves to the next step, and that
 decision's status write is lost. The next decision doesn't know the step passed, so it runs it again: the canary
