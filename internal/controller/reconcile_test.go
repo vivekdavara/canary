@@ -132,9 +132,12 @@ func TestAReconcileWithNothingNewWritesNothing(t *testing.T) {
 }
 
 // The operator keeps no state of its own: a new operator process (here, a second manager after the first stopped)
-// carries on a rollout where the last one left it, keeping the step's start time.
+// carries on a rollout where the last one left it, keeping the step's start time. Each operator has a fixed clock,
+// the second ten minutes after the first, so a start time reset by the restart would differ (status times are stored
+// to the second, and the whole test takes less than one).
 func TestANewOperatorCarriesOn(t *testing.T) {
-	stop := runOperator(t)
+	first := time.Date(2030, 1, 1, 12, 0, 0, 0, time.UTC)
+	stop := runOperatorWithClock(t, func() time.Time { return first })
 	c := testenv.Get(t).Client
 	ctx := context.Background()
 	ns := testenv.Get(t).Namespace(t)
@@ -160,7 +163,7 @@ func TestANewOperatorCarriesOn(t *testing.T) {
 	if err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: "web-canary"}, &canary); err != nil {
 		t.Fatal(err)
 	}
-	runOperator(t)
+	runOperatorWithClock(t, func() time.Time { return first.Add(10 * time.Minute) })
 	// The pause doubled: the new operator reconciles (a new generation) and keeps the step's start time, so the pause
 	// still ends two hours after the old operator saw the pods ready, not two hours after the restart.
 	paused.Spec.Steps[0].Pause = &metav1.Duration{Duration: 2 * time.Hour}
@@ -168,6 +171,9 @@ func TestANewOperatorCarriesOn(t *testing.T) {
 		t.Fatal(err)
 	}
 	got = eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.ObservedGeneration == paused.Generation })
+	if !paused.Status.StepStartedAt.Time.Equal(first) {
+		t.Fatalf("the first operator recorded stepStartedAt %v; want its clock's %v", paused.Status.StepStartedAt, first)
+	}
 	if !got.Status.StepStartedAt.Equal(paused.Status.StepStartedAt) || got.Status.Phase != rolloutsv1alpha1.PhaseProgressing {
 		t.Errorf("status %+v; want still paused, stepStartedAt %v kept across operators", got.Status, paused.Status.StepStartedAt)
 	}

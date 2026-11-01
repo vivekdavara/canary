@@ -36,6 +36,12 @@ func startOperator(t *testing.T) client.Client {
 // has (the test's end calls it too; a second call does nothing).
 func runOperator(t *testing.T) (stop func()) {
 	t.Helper()
+	return runOperatorWithClock(t, nil)
+}
+
+// runOperatorWithClock is runOperator with the reconciler's clock set (time.Now when nil).
+func runOperatorWithClock(t *testing.T, now func() time.Time) (stop func()) {
+	t.Helper()
 	env := testenv.Get(t)
 	mgr, err := ctrl.NewManager(env.OperatorConfig(t), ctrl.Options{
 		Scheme:                 env.Scheme,
@@ -51,7 +57,9 @@ func runOperator(t *testing.T) (stop func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := New(mgr).SetupWithManager(mgr); err != nil {
+	r := New(mgr)
+	r.Now = now
+	if err := r.SetupWithManager(mgr); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
