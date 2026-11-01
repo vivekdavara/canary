@@ -128,6 +128,7 @@ play its part: they write a Deployment's status (`markReady`) when its pods woul
 | `internal/rollout/decide_test.go` (unit) | whole rollouts through a hand-simulated Deployment controller: first apply, steps, pauses timed from readiness, promotion, a restart mid-rollout, a revert, a template change during promotion, a deleted stable, steps shrinking, one pod, a promotion whose status write was lost; and 3,000 seeded random walks (pods settling one Deployment at a time, time passing, new templates, reverts) checking after every decision that ready pods never drop below `replicas`, that the status agrees with itself, and that every walk ends `Healthy` at the template |
 | `internal/controller/rollout_test.go` | a whole rollout against the API server as the operator's own user: the stable's labels, selector, owner and strategy, the stable kept at 4 until the canary's pod is ready, the canary kept during the promotion, the four Events; a 2 s pause ending on its own requeue; a template the API server refuses as a Deployment, then fixed; someone else's Deployment with the rollout's name, reported, and the conflict clearing itself when it's deleted; Deployments deleted by hand coming back |
 | `internal/controller/undecodable_test.go` | a rollout with a probe port beyond int32 (accepted, undecodable) gets `InvalidSpec` on its own status while another rollout keeps being reconciled |
+| `internal/controller/rollout_test.go` (`TestARolloutsWrites`) | a whole rollout's writes counted at the operator's own client, and none in the two seconds after it ends: a guard against a reconcile that writes in a loop (a status carrying the time wrote 984 patches in those two seconds) |
 | `internal/controller/reconcile_test.go` | `Reconcile` called by hand through an interceptor client: a status computed from a spec that changed before the patch is refused (the optimistic lock); a reconcile with nothing new writes nothing; a second operator (fixed clocks, ten minutes apart) keeps a paused step's start time |
 | `internal/controller/canaryrollout_controller_test.go` | status follows the spec through template and replica changes; fields the reconciler doesn't own are kept; a missing rollout is no error |
 | `cmd/canary/main_test.go` | the binary from its flags and a kubeconfig: probes answer, a rollout is reconciled, the reconcile is counted in its metrics, a clean stop; with `--leader-elect` it takes the Lease using only the leader-election Role; `--help` |
@@ -152,6 +153,11 @@ No cluster runs here (no kind locally; day 4 runs one in CI), so there are no ro
   skipped.
 - `TestRandomWalks`: 3,000 walks of 60 random actions plus a settling tail, 0.12 s
   (`go test -run TestRandomWalks -v ./internal/rollout/`).
+- A whole rollout of 4 pods (first apply, steps of 25% and 50% with no pauses, promotion) costs the operator **2
+  creates, 3 Deployment updates and 9 status patches**, the same in three runs, and no write in the two seconds after
+  it ends (`go test -run TestARolloutsWrites -v ./internal/controller/` with `KUBEBUILDER_ASSETS` set, at
+  `951022f`; the test counts at the operator's own client). The stable never got a separate 4 -> 3 update: with no
+  pause, step 2 began as soon as step 1's pod was ready.
 - The CRD is unchanged from day 1: 636,521 bytes with descriptions.
 
 ## Review of day 1
