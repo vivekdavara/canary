@@ -125,7 +125,9 @@ play its part: they write a Deployment's status (`markReady`) when its pods woul
 | `api/v1alpha1/validation_test.go` | each CRD rule refuses with its message, each boundary value is accepted, raw input the typed struct can't express (`pause: 1d`, a quoted threshold, missing required fields), the defaults, template labels surviving pruning, defaults filled inside the pod template, status as a subresource, the samples |
 | `internal/revision/revision_test.go` (unit) | a pinned revision (checked against `shasum` of the JSON), a valid label value, every kind of change moves it, map order and quantity spelling don't |
 | `internal/rollout/split_test.go` (unit) | the split against DESIGN's rules for all 100,000 allowed inputs (replicas 1-1000, weight 1-100), and worked examples |
-| `internal/rollout/decide_test.go` (unit) | whole rollouts through a hand-simulated Deployment controller: first apply, steps, pauses timed from readiness, promotion, a restart mid-rollout, a revert, a template change during promotion, a deleted stable, steps shrinking, one pod, a promotion whose status write was lost; and 3,000 seeded random walks (pods settling one Deployment at a time, time passing, new templates, reverts) checking after every decision that ready pods never drop below `replicas`, that the status agrees with itself, and that every walk ends `Healthy` at the template |
+| `internal/rollout/review_d2_*_test.go` (unit) | the day 2 review's state-machine findings, as it wrote them |
+| `internal/controller/review_d2_*_test.go` | the day 2 review's operator findings: a pause's full length (fixed clocks), a rollout being deleted, the role under `OwnerReferencesPermissionEnforcement` (a second API server with that plugin) |
+| `internal/rollout/decide_test.go` (unit) | whole rollouts through a hand-simulated Deployment controller: first apply, steps, pauses timed from readiness, promotion, a restart mid-rollout, a revert, a template change during promotion, a deleted stable, steps shrinking, one pod, a promotion whose status write was lost; and 3,000 seeded random walks (pods settling one Deployment at a time, time passing, new templates, reverts) checking after every decision that ready pods never drop below `replicas`, that the status agrees with itself, and that every walk ends `Healthy` at the template; and 5,000 walks that also edit steps and replicas, change the template mid-rollout, delete either Deployment and lose status writes (each move counted, at least 1,000 times), checking that no decision takes ready pods below `min(replicas, what was ready)` |
 | `internal/controller/rollout_test.go` | a whole rollout against the API server as the operator's own user: the stable's labels, selector, owner and strategy, the stable kept at 4 until the canary's pod is ready, the canary kept during the promotion, the four Events; a 2 s pause ending on its own requeue; a template the API server refuses as a Deployment, then fixed; someone else's Deployment with the rollout's name, reported, and the conflict clearing itself when it's deleted; Deployments deleted by hand coming back |
 | `internal/controller/undecodable_test.go` | a rollout with a probe port beyond int32 (accepted, undecodable) gets `InvalidSpec` on its own status while another rollout keeps being reconciled |
 | `internal/controller/rollout_test.go` (`TestARolloutsWrites`) | a whole rollout's writes counted at the operator's own client, and none in the two seconds after it ends: a guard against a reconcile that writes in a loop (a status carrying the time wrote 984 patches in those two seconds) |
@@ -171,6 +173,30 @@ formats get different revisions. The three reconciler mechanisms it listed as un
 no-change return, the conflict branch) have tests now, each run as a mutant (the conflict branch returning its error
 fails `TestAStatusFromAnOlderSpecIsNotWritten` too).
 
+## Review of day 2
+
+One review agent at `3334dc0` (25 minutes, its own worktree, findings as failing tests, kept as `review_d2_*`)
+reproduced 10 defects; two were already fixed by then (`d825984`, `4f6aa43`). Fixed:
+
+- **Capacity, in the moves the random walks never made**: editing the steps or `replicas` during a pause applied the
+  new split to both Deployments at once (7 of 10 pods ready); cutting the steps kept the old step's start time, so the
+  rollout promoted at once and shrank the canary; a deleted stable took the canary to 0 before any new stable pod was
+  ready. A pause now belongs to the pods it started with (DESIGN.md, "A step"), and a missing stable keeps the canary.
+- **A lost status write while the template changed and changed back** left a pause running for a canary on the
+  other revision, which then promoted.
+- **Pauses ended up to a second early** (status times are stored to the second): starts are rounded up.
+- **A rollout being deleted got its Deployments recreated** during a foreground delete.
+- **The role wasn't enough under `OwnerReferencesPermissionEnforcement`** (OpenShift): no Deployment was ever
+  created. `update` on `canaryrollouts/finalizers` added; `get` on Deployments (unused) removed.
+- The Promoting Event was lost with a lost status write; `currentStep` could leave the steps' range in a promotion.
+- Fixed meanwhile: a `DeploymentConflict` never cleared on its own; two tests raced the operator's status writes.
+
+It also listed mechanisms it could remove with every test passing (the readiness rule's parts, Events only after a
+status write, `Available` going False, `canaryWeight`, the undecodable report's lock and skip, Warning vs Normal):
+each has a test now, run again as a mutant. And it named what the random walk never did (edit steps or replicas,
+delete a Deployment, lose a write, change the template mid-rollout): `TestRandomWalksWithEdits` does each thousands
+of times, and fails with the pause fix, the deleted-stable fix or the step clamp removed.
+
 ## What went wrong on day 2
 
 - The random walks found a capacity drop in my first `Decide`: a new rollout started while the last one's canary
@@ -202,6 +228,7 @@ build.
 ## Limitations
 
 - Day 2: no analysis, no rollback and no progress deadline yet (day 3); steps advance on their pauses alone.
+- Editing the steps or `replicas` mid-pause restarts the step's pause (its pods change).
 - A restart from a later step, or a new rollout right after a revert, keeps the old canary's pods (old version) until
   the stable is back at its count: capacity over speed.
 - A hand edit to a Deployment's pod template isn't undone (templates are compared by their revision label).

@@ -260,6 +260,40 @@ mutant.
 - `--leader-elect` was a flag with nothing behind it (above).
 - The public GitHub repository couldn't be created from the scheduled session, so CI hasn't run.
 
+## The review (day 2)
+
+**What did the day 2 review find?**
+One agent at `3334dc0`, 25 minutes, findings as failing tests (`review_d2_*`). Ten defects, two already fixed by
+then. The important ones were all in moves my random walk never made: editing the steps or replicas during a pause
+applied the new split to both Deployments at once (7 of 10 pods ready); cutting the steps kept the old step's start
+time, so the rollout promoted immediately; a lost status write while the template changed and changed back left a
+pause running for a canary on the other revision; a deleted stable took the canary to 0 at once. Also: pauses ended
+up to a second early, a rollout being deleted got its Deployments recreated, and the role wasn't enough on clusters
+with `OwnerReferencesPermissionEnforcement`.
+
+**What was the fix for the pause problems?**
+One rule: a pause belongs to the pods it started with. If the canary Deployment isn't set to the step's count and
+the template's revision any more, the step waits for its pods again (under the capacity rules) and the pause starts
+over. That covers edited steps, edited replicas, cut steps and the lost write, rather than four special cases. A pod
+lost mid-pause doesn't restart it: the Deployment is still *set* to the step's count, it just isn't all ready.
+
+**Why did the random walk miss them?**
+Because it never made those moves: new templates only from `Healthy`, no edits, no deletions, no lost writes. The
+review said exactly that. `TestRandomWalksWithEdits` makes each of those moves thousands of times (and counts them,
+so a generator change that stops making one fails the test), and fails with each fix removed. The lesson is the same
+as Quarry's: ask which mutants a generator would never distinguish.
+
+**Why does the operator need `update` on `canaryrollouts/finalizers`?**
+Its Deployments carry a controller reference with `blockOwnerDeletion: true` (`SetControllerReference` sets it), so a
+foreground delete of the rollout waits for them. The `OwnerReferencesPermissionEnforcement` admission plugin
+(on in OpenShift, off in kind) only lets a user set that if they may update the owner's finalizers. The review's
+test starts a second API server with the plugin; with the old role no Deployment was ever created.
+
+**Why round pause starts up, not down?**
+The API server stores status times to the second. Written as 10:00:00.9 and read back as 10:00:00, a 2-minute pause
+ended at 10:02:00, 0.9 s early. Rounding down would do the same; rounding up to 10:00:01 makes it run 2m0.1s, never
+less than asked.
+
 ## What went wrong on day 2
 
 - The first `Decide` could drop capacity after a revert followed by a new template; the random walks found it

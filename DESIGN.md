@@ -133,7 +133,7 @@ Why these choices:
 |---|---|
 | `observedGeneration` | the `metadata.generation` the status describes |
 | `updateRevision` | the revision of `spec.template` (below) |
-| `stableRevision` | the revision the stable Deployment runs (its pod template's revision label) |
+| `stableRevision` | the revision of the stable Deployment's template (its revision label); a promotion sets it when it starts, while the stable's pods are still being replaced |
 | `canaryRevision` | the revision under test, empty when none |
 | `rolledBackRevision` | the last revision rolled back, so it isn't retried until the template changes (day 3) |
 | `phase` | `Healthy`, `Progressing`, `Promoting` or `RolledBack` (day 3) |
@@ -187,7 +187,8 @@ be woken (the end of a pause) and the Events to record. The reconciler only read
 
 1. **First apply.** There is nothing to compare a first version with, so the operator creates the stable Deployment
    from the template at `replicas` pods, and no canary. Phase `Healthy`. The same happens if the stable Deployment is
-   deleted: the version it ran is gone with it, so the template becomes the stable version.
+   deleted: the version it ran is gone with it, so the template becomes the stable version (skipping any steps
+   left). A canary keeps its pods until the new stable's are ready, since they may be the only ones serving.
 2. **Template change.** A revision other than the stable's starts a rollout at step 0: `canaryRevision` records it,
    and the canary Deployment gets the template. If a rollout is already in progress for another revision, it restarts
    at step 0 with the new one.
@@ -196,13 +197,22 @@ be woken (the end of a pause) and the Events to record. The reconciler only read
    "Ready" is what `kubectl rollout status` waits for, with ready pods: the Deployment controller has seen the latest
    spec (`observedGeneration`), and its updated, ready and total pods all equal its replicas. Once the step's canary
    pods are ready, `stepStartedAt` is set and the step's pause runs from then (time spent waiting for pods doesn't
-   count, and a pod lost later doesn't restart it). When the pause is over the next step begins; a step with a 0s
-   pause passes straight through, so the stable never goes down to that step's count. Day 3 adds the analysis at the
-   end of the pause and the `progressDeadlineSeconds` rollback.
+   count, and a pod lost later doesn't restart it). The start is rounded up to a whole second, because the API
+   server stores status times to the second: a start written with its fraction and read back truncated would end
+   the pause up to a second early. When the pause is over the next step begins; a step with a 0s pause passes
+   straight through, so the stable never goes down to that step's count. Day 3 adds the analysis at the end of the
+   pause and the `progressDeadlineSeconds` rollback.
+
+   **A pause belongs to the pods it started with.** If the canary Deployment is no longer set to the step's count
+   and the template's revision, the step waits for its pods again (under the capacity rules below) and its pause
+   starts over. That happens when the steps or `replicas` are edited mid-pause (the step's split changes), when the
+   steps are cut so the current index falls back to an earlier step, and when a status write was lost while the
+   template changed and changed back (the canary then runs the other revision). Day 2's review found each of those
+   applying the new split to both Deployments at once, or promoting on a pause that belonged to other pods.
 4. **Promotion.** After the last step the stable Deployment takes the template at `replicas` pods (phase
-   `Promoting`). The operator's Deployments replace pods with `maxUnavailable: 0`, and the canary keeps its pods until
-   the stable's are all ready at the new revision; then the canary goes to 0, `stableRevision` is the new revision,
-   and the phase is `Healthy` again.
+   `Promoting`). The operator's Deployments replace pods with `maxUnavailable: 0`, and the canary keeps the pods it
+   has until the stable's are all ready at the new revision; then the canary goes to 0 and the phase is `Healthy`
+   again. `currentStep` stays at the last step (kept in range if the steps are cut meanwhile).
 5. **The template back to the stable's revision** mid-rollout ends the rollout (`RolloutReverted`): the stable goes
    back to `replicas` pods, and the canary keeps its pods until the stable has them all, then goes to 0.
 
@@ -212,7 +222,9 @@ at all replicas; and **a canary with more pods than the current step's** (a rest
 rollout started while the last one's canary still drains) is neither scaled down nor given the new template until the
 stable is settled at its count. Scaling it down first would drop capacity; giving it the new template at its old
 count would send the new version more than the step's share. The random walks found that last case while `Decide`
-was being written.
+was being written. A second walk, `TestRandomWalksWithEdits`, makes the moves the first never did (editing steps
+and `replicas`, changing the template mid-rollout, deleting either Deployment, losing a status write), each
+thousands of times, and checks that no decision takes the ready pods below `min(replicas, what was ready)`.
 
 The operator keeps no state of its own: everything it needs is in the status (phase, `canaryRevision`,
 `currentStep`, `stepStartedAt`) and the two Deployments (the revision each runs is its pod template's revision label),
@@ -221,7 +233,9 @@ to be requeued at the end of a pause; everything else wakes it through its watch
 
 ### One reconcile
 
-1. Read the rollout from the API server as unstructured JSON and decode it ("Reading rollouts", below).
+1. Read the rollout from the API server as unstructured JSON and decode it ("Reading rollouts", below). A rollout
+   being deleted (`deletionTimestamp` set) is left alone: with a foreground delete the garbage collector removes the
+   Deployments first, and recreating them would fight it.
 2. Read `<name>-stable` and `<name>-canary` from the cache. One that exists but isn't controlled by this rollout is
    someone else's: the operator leaves it alone and reports `Progressing` False, reason `DeploymentConflict`. Besides
    the Deployments it owns, the operator watches Deployments with a rollout's names that no rollout controls, so
@@ -262,6 +276,10 @@ cache: the API server validated them in full.
 - The operator compares a Deployment's template only by its revision label: a hand edit to a Deployment's pod
   template isn't undone (a hand edit to its replicas is, at the next reconcile). The rollout's template is the way to
   change the pods.
+- Permissions (`config/rbac/role.yaml`, generated): rollouts get, list, watch; their status patch; their
+  finalizers update, which the controller reference's `blockOwnerDeletion` needs on clusters running the
+  `OwnerReferencesPermissionEnforcement` admission plugin (OpenShift does; a test starts an API server with it);
+  Deployments list, watch, create, update (reads come from the cache, so no get); Events create and patch.
 - Events (events.k8s.io/v1) on the rollout: `RolloutStarted`, `StepAdvanced`, `Promoting`, `Promoted`,
   `RolloutReverted` (Normal); `InvalidSpec`, `DeploymentConflict` (Warning). Day 3 adds `RolledBack` and
   `AnalysisFailed`.
