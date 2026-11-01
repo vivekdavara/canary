@@ -75,7 +75,7 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("creating the manager: %w", err)
 	}
-	if err := (&controller.CanaryRolloutReconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
+	if err := controller.New(mgr).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setting up the controller: %w", err)
 	}
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

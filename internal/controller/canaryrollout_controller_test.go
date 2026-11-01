@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"iter"
 	"os"
 	"testing"
 	"time"
@@ -40,7 +41,7 @@ func startOperator(t *testing.T) client.Client {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := (&CanaryRolloutReconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
+	if err := New(mgr).SetupWithManager(mgr); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -68,6 +69,19 @@ func rollout(ns, image string) *rolloutsv1alpha1.CanaryRollout {
 			},
 			Steps: []rolloutsv1alpha1.Step{{Weight: 25}, {Weight: 50}},
 		},
+	}
+}
+
+// poll yields every 50 ms for up to 10 seconds: a loop over it that hasn't returned by then has timed out.
+func poll(t *testing.T) iter.Seq[int] {
+	return func(yield func(int) bool) {
+		deadline := time.Now().Add(10 * time.Second)
+		for i := 0; time.Now().Before(deadline); i++ {
+			if !yield(i) {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
 	}
 }
 
@@ -156,7 +170,7 @@ func TestReconcileKeepsTheRestOfTheStatus(t *testing.T) {
 // A rollout deleted before its reconcile is no error.
 func TestReconcileOfAMissingRollout(t *testing.T) {
 	env := testenv.Get(t)
-	r := &CanaryRolloutReconciler{Client: env.Client}
+	r := &CanaryRolloutReconciler{Client: env.Client, APIReader: env.Client}
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Namespace: "default", Name: "gone"}})
 	if err != nil || res != (ctrl.Result{}) {
 		t.Errorf("Reconcile = %+v, %v; want an empty result and no error", res, err)
