@@ -218,11 +218,20 @@ func TestReconcileKeepsTheRestOfTheStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := client.ObjectKeyFromObject(ro)
-	got := eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.ObservedGeneration == 1 })
-	got.Status.RolledBackRevision = "0123456789abcdef"
-	if err := c.Status().Update(ctx, got); err != nil {
+	eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool { return r.Status.ObservedGeneration == 1 })
+	// The operator may write the status meanwhile (its Deployment's events bring reconciles): read again on a conflict.
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var cur rolloutsv1alpha1.CanaryRollout
+		if err := c.Get(ctx, key, &cur); err != nil {
+			return err
+		}
+		cur.Status.RolledBackRevision = "0123456789abcdef"
+		return c.Status().Update(ctx, &cur)
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	var got *rolloutsv1alpha1.CanaryRollout
 	got = edit(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) {
 		r.Spec.Template.Spec.Containers[0].Image = "example.com/web:2"
 	})
