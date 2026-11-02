@@ -9028,6 +9028,27 @@ spec:
             description: CanaryRolloutStatus is what the operator observed and did.
               DESIGN.md, "Status", says which day fills each field.
             properties:
+              analysis:
+                description: |-
+                  Analysis counts the current step's checks (DESIGN.md, "Analysis"); after a rollback, those of the step that
+                  rolled back.
+                properties:
+                  checks:
+                    description: Checks is the number of checks run since the step's
+                      pause began.
+                    format: int32
+                    type: integer
+                  failedChecks:
+                    description: FailedChecks is how many of them failed; one more
+                      than analysis.failureLimit rolls the rollout back.
+                    format: int32
+                    type: integer
+                  lastCheckAt:
+                    description: LastCheckAt is when the last check ran; the next
+                      is due an interval later.
+                    format: date-time
+                    type: string
+                type: object
               canaryReplicas:
                 format: int32
                 type: integer
@@ -9133,6 +9154,12 @@ spec:
               stepStartedAt:
                 description: StepStartedAt is when the current step's canary pods
                   became ready and its pause began.
+                format: date-time
+                type: string
+              stepWaitingSince:
+                description: |-
+                  StepWaitingSince is when the current step began waiting for its canary pods; if they aren't ready
+                  progressDeadlineSeconds later, the rollout rolls back. Cleared when the step's pause starts.
                 format: date-time
                 type: string
               updateRevision:

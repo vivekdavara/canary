@@ -183,6 +183,18 @@ type CanaryRolloutStatus struct {
 	// +optional
 	StepStartedAt *metav1.Time `json:"stepStartedAt,omitempty"`
 
+	// StepWaitingSince is when the current step began waiting for its canary pods; if they aren't ready
+	// progressDeadlineSeconds later, the rollout rolls back. Cleared when the step's pause starts.
+	//
+	// +optional
+	StepWaitingSince *metav1.Time `json:"stepWaitingSince,omitempty"`
+
+	// Analysis counts the current step's checks (DESIGN.md, "Analysis"); after a rollback, those of the step that
+	// rolled back.
+	//
+	// +optional
+	Analysis *AnalysisStatus `json:"analysis,omitempty"`
+
 	// StableReplicas and CanaryReplicas are the ready pods of each Deployment.
 	//
 	// +optional
@@ -201,6 +213,24 @@ type CanaryRolloutStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// AnalysisStatus counts one step's checks. The AnalysisPassing condition says how the last one went.
+type AnalysisStatus struct {
+	// Checks is the number of checks run since the step's pause began.
+	//
+	// +optional
+	Checks int32 `json:"checks,omitempty"`
+
+	// FailedChecks is how many of them failed; one more than analysis.failureLimit rolls the rollout back.
+	//
+	// +optional
+	FailedChecks int32 `json:"failedChecks,omitempty"`
+
+	// LastCheckAt is when the last check ran; the next is due an interval later.
+	//
+	// +optional
+	LastCheckAt *metav1.Time `json:"lastCheckAt,omitempty"`
 }
 
 // CanaryRollout runs a pod template and moves it to new versions in canary steps.

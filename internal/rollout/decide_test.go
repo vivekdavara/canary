@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	v1 "github.com/vivekdavara/canary/api/v1alpha1"
+	"github.com/vivekdavara/canary/internal/analysis"
 )
 
 // world is a rollout and its two Deployments, with a Deployment controller simulated by hand: run applies a plan as
@@ -25,6 +26,11 @@ type world struct {
 	events         []string       // reasons, in order
 	edited         bool           // the rollout in progress was edited (TestRandomWalksWithEdits)
 	pauses         map[int32]bool // the steps whose pause started in the rollout in progress, as written
+	// checks answers a check when a decision says one is due, as the operator's analysis would; nil passes them all.
+	checks func() analysis.Check
+	// checked counts the checks run; warnings lists the Warning Events' reasons, in order.
+	checked  int
+	warnings []string
 }
 
 func newWorld(t *testing.T, replicas int32, steps ...v1.Step) *world {
@@ -43,15 +49,37 @@ func step(weight int32, pause time.Duration) v1.Step {
 // run decides once and applies the plan: the status is written, and each Deployment gets its target.
 func (w *world) run() Plan {
 	w.t.Helper()
-	p := Decide(Input{Spec: &w.spec, Revision: w.rev, Status: w.state, Stable: w.stable, Canary: w.canary, Now: w.now})
+	in := Input{Spec: &w.spec, Revision: w.rev, Status: w.state, Stable: w.stable, Canary: w.canary, Now: w.now}
+	p := Decide(in)
+	if p.AnalysisDue {
+		// As the operator does: run the check, and decide again from the same input with its result.
+		c := passing
+		if w.checks != nil {
+			c = w.checks()
+		}
+		w.checked++
+		in.Check = &c
+		if p = Decide(in); p.AnalysisDue {
+			w.t.Fatalf("a check is still due after one ran: %+v", p)
+		}
+	}
 	w.state = p.State
 	w.stable = apply(w.stable, p.Stable, w.rev)
 	w.canary = apply(w.canary, p.Canary, w.rev)
 	for _, e := range p.Events {
 		w.events = append(w.events, e.Reason)
+		if e.Warning {
+			w.warnings = append(w.warnings, e.Reason)
+		}
 	}
 	return p
 }
+
+// passing and failing are checks of one metric.
+var (
+	passing = analysis.Check{Metrics: []analysis.MetricResult{{Name: "error-rate", Value: 0.001, Measured: true, Passed: true, Why: "max 0.01"}}}
+	failing = analysis.Check{Metrics: []analysis.MetricResult{{Name: "error-rate", Value: 0.2, Measured: true, Why: "above max 0.01"}}}
+)
 
 func apply(d *Deployment, t Target, rev string) *Deployment {
 	switch {
@@ -362,6 +390,7 @@ func TestRandomWalks(t *testing.T) {
 			steps = append(steps, step(w, time.Duration(rng.IntN(3))*time.Minute))
 		}
 		w := newWorld(t, r, steps...)
+		noDeadline(w)
 		w.run()
 		w.settle()
 		revs := 1
@@ -392,6 +421,13 @@ func TestRandomWalks(t *testing.T) {
 			t.Fatalf("seed %d: ended %+v, stable %+v, canary %+v; want Healthy at %s", seed, w.state, w.stable, w.canary, w.rev)
 		}
 	}
+}
+
+// noDeadline sets the progress deadline to its maximum, 24 hours, beyond any walk's time, so that day 2's walks keep
+// testing what they were written for: pods that are never ready in a walk would otherwise roll it back.
+// TestRandomWalksWithAnalysis walks with the deadline.
+func noDeadline(w *world) {
+	w.spec.ProgressDeadlineSeconds = ptr(int32(86400))
 }
 
 // settleSome makes one Deployment's pods ready (the two don't settle together in a cluster).
@@ -472,6 +508,7 @@ func TestRandomWalksWithEdits(t *testing.T) {
 	for seed := range uint64(5000) {
 		rng := rand.New(rand.NewPCG(seed, 11))
 		w := newWorld(t, int32(1+rng.IntN(12)), randomSteps(rng)...)
+		noDeadline(w)
 		w.run()
 		w.settle()
 		revs, prev := 1, ""

@@ -7,6 +7,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	v1 "github.com/vivekdavara/canary/api/v1alpha1"
+	"github.com/vivekdavara/canary/internal/analysis"
 )
 
 // Deployment is what the operator read of one of its two Deployments.
@@ -35,8 +36,22 @@ type State struct {
 	Phase          v1.Phase
 	StableRevision string
 	CanaryRevision string
-	CurrentStep    *int32
-	StepStartedAt  *metav1.Time
+	// RolledBackRevision is the last revision rolled back. It is kept until another rollback replaces it; the
+	// rollout holds while the template is that revision and the phase is RolledBack.
+	RolledBackRevision string
+	CurrentStep        *int32
+	StepStartedAt      *metav1.Time
+	// StepWaitingSince is when the current step began waiting for its canary pods (the progress deadline runs from
+	// it); nil once its pause has started.
+	StepWaitingSince *metav1.Time
+	// Analysis counts the current pause's checks.
+	Analysis Analysis
+}
+
+// Analysis counts one step's checks: they begin with its pause, and start over when the pause does.
+type Analysis struct {
+	Checks, FailedChecks int32
+	LastCheckAt          *metav1.Time
 }
 
 // Input is everything a decision depends on.
@@ -49,6 +64,9 @@ type Input struct {
 	// Stable and Canary are the two Deployments, nil when missing.
 	Stable, Canary *Deployment
 	Now            time.Time
+	// Check is the check the operator ran because a decision from this same input said one was due
+	// (Plan.AnalysisDue); nil otherwise.
+	Check *analysis.Check
 }
 
 // Target is what one Deployment should become.
@@ -67,6 +85,8 @@ type Target struct {
 // Event is an Event to record on the rollout.
 type Event struct {
 	Reason, Message string
+	// Warning makes it a Warning Event; otherwise it is Normal.
+	Warning bool
 }
 
 // Reasons of the Progressing condition and of Events.
@@ -75,12 +95,26 @@ const (
 	ReasonWaitingForCanary = "WaitingForCanary" // a step's canary pods aren't all ready yet
 	ReasonStepPaused       = "StepPaused"       // a step's pods are ready and its pause is running
 	ReasonPromoting        = "Promoting"        // the stable is taking the canary's version
+	ReasonRolledBack       = "RolledBack"       // the rollout failed; the stable runs the old version
 
 	EventRolloutStarted  = "RolloutStarted"
 	EventStepAdvanced    = "StepAdvanced"
 	EventPromoting       = "Promoting"
 	EventPromoted        = "Promoted"
 	EventRolloutReverted = "RolloutReverted"
+	EventAnalysisFailed  = "AnalysisFailed" // Warning: a check failed
+	EventRolledBack      = "RolledBack"     // Warning
+
+	// Reasons of the AnalysisPassing condition.
+	ReasonChecksPassed = "ChecksPassed"
+	ReasonCheckFailed  = "CheckFailed"
+)
+
+// Defaults of the spec's optional fields, which the API server fills in; the operator falls back to them for a spec
+// that didn't go through it (the pure tests).
+const (
+	DefaultProgressDeadline = 600 * time.Second
+	DefaultInterval         = 30 * time.Second
 )
 
 // Plan is what the operator does next.
@@ -94,25 +128,63 @@ type Plan struct {
 	// rollout and its Deployments bring reconciles of their own.
 	RequeueAfter time.Duration
 	Events       []Event
+	// AnalysisDue says a check is due: the operator runs one and decides again from the same input with its result
+	// (Input.Check). The rest of such a plan is safe to carry out as it is (the step holds), but it isn't meant to be.
+	AnalysisDue bool
+	// Checked is the check this decision recorded, for the AnalysisPassing condition; nil when none was.
+	Checked *CheckResult
+}
+
+// CheckResult is the AnalysisPassing condition after a check.
+type CheckResult struct {
+	Passed  bool
+	Message string
 }
 
 // Progressing says whether the plan's Progressing condition is True.
-func (p *Plan) Progressing() bool { return p.Reason != ReasonIdle }
+func (p *Plan) Progressing() bool { return p.Reason != ReasonIdle && p.Reason != ReasonRolledBack }
 
 // Decide is the state machine of DESIGN.md, "The rollout": from the spec, the last status and the two Deployments, the
 // Deployments' targets and the next status. The status is the rollout's memory between reconciles; the stable
 // Deployment's template is the only copy of the stable version, so the stable's template is written only when it is
 // created and when a canary is promoted.
+//
+// Rollback (DESIGN.md, "Rollback"): a step whose canary pods aren't ready within the progress deadline, or whose
+// checks fail more than the failure limit allows, rolls the rollout back. The stable goes back to all replicas with
+// the template it has, the canary keeps its pods until the stable's are ready, and the rollout holds (phase
+// RolledBack) until the template changes.
 func Decide(in Input) Plan {
+	p := decide(in)
+	if p.State.RolledBackRevision == "" {
+		p.State.RolledBackRevision = in.Status.RolledBackRevision
+	}
+	return p
+}
+
+func decide(in Input) Plan {
 	r := in.Spec.Replicas
 	rev := in.Revision
 	stable, canary := in.Stable, in.Canary
 	last := in.Status
 
+	heldBack := last.Phase == v1.PhaseRolledBack && rev == last.RolledBackRevision
+
 	// No stable Deployment: create it from the template, at all replicas. On a first apply there is nothing to
 	// compare the template with; if the stable was deleted, the version it ran is gone with it, so the template
 	// becomes the stable version either way. A canary keeps its pods (the next decision takes it to 0 once the new
 	// stable is ready), since they may be the only ones serving.
+	//
+	// Except after a rollback, while the template is still the revision rolled back: creating the stable from it would
+	// run that revision at all replicas, with no canary and no analysis. The operator holds no other copy of a
+	// version, so it creates nothing and says what to do.
+	if stable == nil && heldBack {
+		return Plan{
+			Canary:  Target{Replicas: replicasOf(canary)},
+			State:   last,
+			Reason:  ReasonRolledBack,
+			Message: fmt.Sprintf("the stable Deployment is gone, and the template is revision %s, which was rolled back: set the template to the version to run", rev),
+		}
+	}
 	if stable == nil {
 		return Plan{
 			Stable:  Target{Replicas: r, FromTemplate: true},
@@ -136,7 +208,7 @@ func Decide(in Input) Plan {
 		var events []Event
 		if last.Phase != v1.PhasePromoting {
 			// The status write that recorded the promotion's start was lost, and its Event with it.
-			events = append(events, Event{EventPromoting, fmt.Sprintf("the last step passed; promoting revision %s", rev)})
+			events = append(events, Event{Reason: EventPromoting, Message: fmt.Sprintf("the last step passed; promoting revision %s", rev)})
 		}
 		if stable.readyAt(rev, r) {
 			return Plan{
@@ -145,7 +217,7 @@ func Decide(in Input) Plan {
 				State:   State{Phase: v1.PhaseHealthy, StableRevision: rev},
 				Reason:  ReasonIdle,
 				Message: fmt.Sprintf("revision %s promoted: the stable runs it", rev),
-				Events:  append(events, Event{EventPromoted, fmt.Sprintf("revision %s promoted: the stable runs it at %d pods", rev, r)}),
+				Events:  append(events, Event{Reason: EventPromoted, Message: fmt.Sprintf("revision %s promoted: the stable runs it at %d pods", rev, r)}),
 			}
 		}
 		return Plan{
@@ -176,9 +248,15 @@ func Decide(in Input) Plan {
 		// The template went back to the stable's version only if the rollout was of another one (a stable recreated
 		// from the template mid-rollout runs the revision that was under test).
 		if (last.Phase == v1.PhaseProgressing || last.Phase == v1.PhasePromoting) && last.CanaryRevision != rev {
-			p.Events = []Event{{EventRolloutReverted, fmt.Sprintf("the template went back to the stable's revision %s; revision %s's rollout ended", rev, last.CanaryRevision)}}
+			p.Events = []Event{{Reason: EventRolloutReverted, Message: fmt.Sprintf("the template went back to the stable's revision %s; revision %s's rollout ended", rev, last.CanaryRevision)}}
 		}
 		return p
+	}
+
+	// Rolled back: hold until the template changes. The stable runs its own version at all replicas, and the canary
+	// keeps its pods until the stable's are all ready.
+	if heldBack {
+		return holdBack(in, last, "")
 	}
 
 	// A version other than the stable's: start a rollout at step 0, or restart one in progress for another version.
@@ -190,7 +268,7 @@ func Decide(in Input) Plan {
 		if last.CanaryRevision != "" && (last.Phase == v1.PhaseProgressing || last.Phase == v1.PhasePromoting) {
 			msg += fmt.Sprintf(" (replacing revision %s's rollout)", last.CanaryRevision)
 		}
-		events = append(events, Event{EventRolloutStarted, msg})
+		events = append(events, Event{Reason: EventRolloutStarted, Message: msg})
 	}
 	st.StableRevision = stable.Revision
 
@@ -217,11 +295,55 @@ func Decide(in Input) Plan {
 	if st.StepStartedAt == nil && canary.readyAt(rev, c) {
 		st.StepStartedAt = &metav1.Time{Time: ceilSecond(in.Now)}
 	}
+	// The checks belong to the pause: they start over with it.
+	if !sameTime(st.StepStartedAt, last.StepStartedAt) {
+		st.Analysis = Analysis{}
+	}
 	if st.StepStartedAt == nil {
 		return waitForCanary(in, st, i, events)
 	}
+	st.StepWaitingSince = nil
 	end := st.StepStartedAt.Add(pauseOf(in.Spec.Steps[i]))
-	if !pauseOver(st.StepStartedAt, in.Spec.Steps[i], in.Now) {
+	holding := !pauseOver(st.StepStartedAt, in.Spec.Steps[i], in.Now)
+
+	// The analysis: a check every interval from the pause's start, while the pause runs and after it until the step
+	// has had one (a step with analysis passes only after a check, so a pause shorter than the interval lasts an
+	// interval). A check that fails more often than the failure limit allows rolls the rollout back.
+	var checked *CheckResult
+	var nextCheck time.Time
+	due := false
+	if a := in.Spec.Analysis; a != nil {
+		nextCheck = st.StepStartedAt.Add(intervalOf(a))
+		if st.Analysis.LastCheckAt != nil {
+			nextCheck = st.Analysis.LastCheckAt.Add(intervalOf(a))
+		}
+		if !in.Now.Before(nextCheck) {
+			if in.Check == nil {
+				due = true
+			} else {
+				st.Analysis.Checks++
+				st.Analysis.LastCheckAt = &metav1.Time{Time: ceilSecond(in.Now)}
+				nextCheck = st.Analysis.LastCheckAt.Add(intervalOf(a))
+				msg := fmt.Sprintf("%s, check %d", stepName(in.Spec, i), st.Analysis.Checks)
+				if in.Check.Passed() {
+					checked = &CheckResult{Passed: true, Message: msg + " passed: " + in.Check.String()}
+				} else {
+					st.Analysis.FailedChecks++
+					limit := failureLimitOf(a)
+					msg += fmt.Sprintf(" failed (%d failed, %d allowed): %s", st.Analysis.FailedChecks, limit, in.Check.String())
+					checked = &CheckResult{Message: msg}
+					events = append(events, Event{Reason: EventAnalysisFailed, Message: msg, Warning: true})
+					if st.Analysis.FailedChecks > limit {
+						p := rollBack(in, st, fmt.Sprintf("%d of %s's checks failed, more than the %d allowed", st.Analysis.FailedChecks, stepName(in.Spec, i), limit), events)
+						p.Checked = checked
+						return p
+					}
+				}
+			}
+		}
+		holding = holding || due || st.Analysis.Checks == 0
+	}
+	if holding {
 		// The stable goes down to the step's count only while the step's canary pods are all ready: one lost
 		// mid-pause doesn't restart the pause, but a replicas edit meanwhile mustn't take the stable below what the
 		// ready pods need.
@@ -229,36 +351,52 @@ func Decide(in Input) Plan {
 		if !canary.readyAt(rev, c) {
 			stableWant = max(s, stable.Replicas)
 		}
+		msg := fmt.Sprintf("%s: pods ready, paused until %s", stepName(in.Spec, i), end.UTC().Format(time.RFC3339))
+		wake := end
+		if a := in.Spec.Analysis; a != nil {
+			msg += fmt.Sprintf("; checks: %d, %d failed, the next at %s", st.Analysis.Checks, st.Analysis.FailedChecks, nextCheck.UTC().Format(time.RFC3339))
+			if !in.Now.Before(end) || nextCheck.Before(end) {
+				wake = nextCheck
+			}
+		}
 		return Plan{
 			Canary:       Target{Replicas: c, FromTemplate: true},
 			Stable:       Target{Replicas: stableWant},
 			State:        st,
 			Reason:       ReasonStepPaused,
-			Message:      fmt.Sprintf("%s: pods ready, paused until %s", stepName(in.Spec, i), end.UTC().Format(time.RFC3339)),
-			RequeueAfter: end.Sub(in.Now),
+			Message:      msg,
+			RequeueAfter: wake.Sub(in.Now),
 			Events:       events,
+			AnalysisDue:  due,
+			Checked:      checked,
 		}
 	}
 
-	// The pause is over: the next step, or after the last one, promotion.
+	// The pause is over (and the step has had a check, if it has analysis): the next step, or after the last one,
+	// promotion.
 	if int(i) == len(in.Spec.Steps)-1 {
 		st.Phase = v1.PhasePromoting
 		st.StableRevision = rev
 		st.StepStartedAt = nil // the step is over; currentStep stays at the last one
+		st.Analysis = Analysis{}
 		return Plan{
 			Stable:  Target{Replicas: r, FromTemplate: true, Promote: true},
 			Canary:  Target{Replicas: replicasOf(canary)},
 			State:   st,
 			Reason:  ReasonPromoting,
 			Message: fmt.Sprintf("promoting revision %s: waiting for the stable's %d pods to be ready", rev, r),
-			Events:  append(events, Event{EventPromoting, fmt.Sprintf("the last step passed; promoting revision %s", rev)}),
+			Events:  append(events, Event{Reason: EventPromoting, Message: fmt.Sprintf("the last step passed; promoting revision %s", rev)}),
+			Checked: checked,
 		}
 	}
 	st.CurrentStep = ptr(i + 1)
 	st.StepStartedAt = nil
+	st.Analysis = Analysis{}
 	c2, s2 := Split(r, in.Spec.Steps[i+1].Weight)
-	events = append(events, Event{EventStepAdvanced, fmt.Sprintf("%s: %d canary and %d stable pods", stepName(in.Spec, i+1), c2, s2)})
-	return waitForCanary(in, st, i+1, events)
+	events = append(events, Event{Reason: EventStepAdvanced, Message: fmt.Sprintf("%s: %d canary and %d stable pods", stepName(in.Spec, i+1), c2, s2)})
+	p := waitForCanary(in, st, i+1, events)
+	p.Checked = checked
+	return p
 }
 
 // waitForCanary is the plan while step i's canary pods aren't all ready: the canary is scaled up first, and the
@@ -268,22 +406,77 @@ func Decide(in Input) Plan {
 // A canary with more pods than the step's (a restart, or a new rollout while the last one's canary still drains)
 // isn't scaled down, nor its pods replaced, until the stable is settled at its count: scaling it down first would
 // drop capacity, and replacing its pods at their old count would send the new version more than the step's share.
+//
+// The wait is bounded by the progress deadline, from when the step began waiting: past it, the rollout rolls back.
 func waitForCanary(in Input, st State, i int32, events []Event) Plan {
 	c, s := Split(in.Spec.Replicas, in.Spec.Steps[i].Weight)
 	stable := Target{Replicas: max(s, in.Stable.Replicas)}
 	canary := Target{Replicas: c, FromTemplate: true}
-	msg := fmt.Sprintf("%s: waiting for %d canary pods of revision %s to be ready", stepName(in.Spec, i), c, in.Revision)
+	msg := fmt.Sprintf("waiting for %d canary pods of revision %s to be ready", c, in.Revision)
 	if in.Canary != nil && in.Canary.Replicas > c && !(in.Stable.Settled && in.Stable.Replicas == stable.Replicas) {
 		canary = Target{Replicas: in.Canary.Replicas}
-		msg = fmt.Sprintf("%s: waiting for the stable's %d pods to be ready before the canary goes down to %d", stepName(in.Spec, i), stable.Replicas, c)
+		msg = fmt.Sprintf("waiting for the stable's %d pods to be ready before the canary goes down to %d", stable.Replicas, c)
+	}
+	if st.StepWaitingSince == nil {
+		st.StepWaitingSince = &metav1.Time{Time: ceilSecond(in.Now)}
+	}
+	deadline := st.StepWaitingSince.Add(progressDeadlineOf(in.Spec))
+	if !in.Now.Before(deadline) {
+		return rollBack(in, st, fmt.Sprintf("%s wasn't ready within the progress deadline of %v (%s)", stepName(in.Spec, i), progressDeadlineOf(in.Spec), msg), events)
 	}
 	return Plan{
-		Canary:  canary,
-		Stable:  stable,
+		Canary:       canary,
+		Stable:       stable,
+		State:        st,
+		Reason:       ReasonWaitingForCanary,
+		Message:      fmt.Sprintf("%s: %s, until %s", stepName(in.Spec, i), msg, deadline.UTC().Format(time.RFC3339)),
+		RequeueAfter: deadline.Sub(in.Now),
+		Events:       events,
+	}
+}
+
+// rollBack ends the rollout of the template's revision: the stable goes back to all replicas with the template it has
+// (the old version), the canary keeps its pods until the stable's are ready, and the rollout holds (holdBack) until
+// the template changes. why says what failed.
+func rollBack(in Input, st State, why string, events []Event) Plan {
+	st.Phase = v1.PhaseRolledBack
+	st.RolledBackRevision = in.Revision
+	st.CanaryRevision = ""
+	st.StepStartedAt, st.StepWaitingSince = nil, nil
+	p := holdBack(in, st, why)
+	p.Events = append(events, Event{
+		Reason:  EventRolledBack,
+		Message: fmt.Sprintf("revision %s rolled back: %s; the stable runs revision %s", in.Revision, why, in.Stable.Revision),
+		Warning: true,
+	})
+	return p
+}
+
+// holdBack is the plan after a rollback, while the template is the revision rolled back: the stable at all replicas
+// with its own template, and the canary kept until the stable's pods are all ready, then 0.
+func holdBack(in Input, st State, why string) Plan {
+	r := in.Spec.Replicas
+	keep := int32(0)
+	if !in.Stable.readyAt(in.Stable.Revision, r) {
+		keep = replicasOf(in.Canary)
+	}
+	st.StableRevision = in.Stable.Revision
+	if why == "" {
+		why = "it failed"
+		if st.CurrentStep != nil {
+			why = fmt.Sprintf("it failed at step %d", *st.CurrentStep+1)
+		}
+	}
+	msg := fmt.Sprintf("revision %s was rolled back (%s); the stable runs revision %s", st.RolledBackRevision, why, in.Stable.Revision)
+	if keep > 0 {
+		msg += fmt.Sprintf(", and the canary keeps its %d pods until the stable's %d are ready", keep, r)
+	}
+	return Plan{
+		Stable:  Target{Replicas: r},
+		Canary:  Target{Replicas: keep},
 		State:   st,
-		Reason:  ReasonWaitingForCanary,
-		Message: msg,
-		Events:  events,
+		Reason:  ReasonRolledBack,
+		Message: msg + "; change the template to roll out another version",
 	}
 }
 
@@ -333,3 +526,32 @@ func ceilSecond(t time.Time) time.Time {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// sameTime says a and b are both nil or the same instant.
+func sameTime(a, b *metav1.Time) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Equal(b)
+}
+
+func progressDeadlineOf(spec *v1.CanaryRolloutSpec) time.Duration {
+	if spec.ProgressDeadlineSeconds == nil {
+		return DefaultProgressDeadline
+	}
+	return time.Duration(*spec.ProgressDeadlineSeconds) * time.Second
+}
+
+func intervalOf(a *v1.Analysis) time.Duration {
+	if a.Interval == nil {
+		return DefaultInterval
+	}
+	return a.Interval.Duration
+}
+
+func failureLimitOf(a *v1.Analysis) int32 {
+	if a.FailureLimit == nil {
+		return 0
+	}
+	return *a.FailureLimit
+}
