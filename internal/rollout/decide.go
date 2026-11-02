@@ -335,17 +335,18 @@ func decide(in Input) Plan {
 					checked = &CheckResult{Passed: true, Message: msg + " passed: " + in.Check.String()}
 				} else {
 					st.Analysis.FailedChecks++
-					limit := failureLimitOf(a)
-					msg += fmt.Sprintf(" failed (%d failed, %d allowed): %s", st.Analysis.FailedChecks, limit, in.Check.String())
+					msg += fmt.Sprintf(" failed (%d failed, %d allowed): %s", st.Analysis.FailedChecks, failureLimitOf(a), in.Check.String())
 					checked = &CheckResult{Message: msg}
 					events = append(events, Event{Reason: EventAnalysisFailed, Message: msg, Warning: true})
-					if st.Analysis.FailedChecks > limit {
-						p := rollBack(in, st, fmt.Sprintf("%d of %s's checks failed, more than the %d allowed", st.Analysis.FailedChecks, stepName(in.Spec, i), limit), events)
-						p.Checked = checked
-						return p
-					}
 				}
 			}
+		}
+		// More failed checks than the limit allows: after a failed check, or with the limit lowered since (it is read
+		// at every decision, so a step never passes with more failures than the spec now allows).
+		if limit := failureLimitOf(a); st.Analysis.FailedChecks > limit {
+			p := rollBack(in, st, fmt.Sprintf("%d of %s's checks failed, more than the %d allowed", st.Analysis.FailedChecks, stepName(in.Spec, i), limit), events)
+			p.Checked = checked
+			return p
 		}
 		holding = holding || due || st.Analysis.Checks == 0
 	}

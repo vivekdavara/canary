@@ -3,6 +3,7 @@ package rollout
 import (
 	"fmt"
 	"math/rand/v2"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,6 +55,11 @@ func TestRandomWalksWithAnalysis(t *testing.T) {
 			case 8:
 				w.spec.Replicas = int32(1 + rng.IntN(12))
 				census["replicas changed"]++
+			case 10:
+				if rng.IntN(3) == 0 {
+					w.spec.Analysis.FailureLimit = ptr(int32(rng.IntN(3)))
+					census["failure limit changed"]++
+				}
 			case 9:
 				if d := []*Deployment{w.stable, w.canary}[rng.IntN(2)]; d != nil && d.ReadyReplicas > 0 {
 					d.ReadyReplicas--
@@ -81,7 +87,8 @@ func TestRandomWalksWithAnalysis(t *testing.T) {
 		}
 	}
 	for _, what := range []string{"rolled back by the deadline", "rolled back by the analysis", "failed check tolerated", "step passed after checks",
-		"promoted", "ended Healthy", "ended rolled back", "status write lost", "lost while checking", "decided while held", "ready pod lost", "replicas changed"} {
+		"promoted", "ended Healthy", "ended rolled back", "status write lost", "lost while checking", "decided while held", "ready pod lost", "replicas changed",
+		"failure limit changed"} {
 		if census[what] < 300 {
 			t.Errorf("%q happened %d times in the walks; want at least 300", what, census[what])
 		}
@@ -149,10 +156,14 @@ func (w *world) stepAnalysed(seed uint64, i int, lost bool, census map[string]in
 	}
 	for _, e := range p.Events {
 		switch {
+		case e.Reason == EventRolledBack && strings.Contains(e.Message, "progress deadline"):
+			census["rolled back by the deadline"]++
 		case e.Reason == EventRolledBack && p.Checked != nil && !p.Checked.Passed:
 			census["rolled back by the analysis"]++
+		case e.Reason == EventRolledBack && strings.Contains(e.Message, "checks failed"):
+			census["rolled back by a lowered failure limit"]++
 		case e.Reason == EventRolledBack:
-			census["rolled back by the deadline"]++
+			fail("a rollback for no known reason: %q", e.Message)
 		case e.Reason == EventAnalysisFailed && p.State.Phase != v1.PhaseRolledBack:
 			census["failed check tolerated"]++
 		}

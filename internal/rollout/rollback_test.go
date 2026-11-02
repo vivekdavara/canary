@@ -376,3 +376,23 @@ func TestAStepHeldForItsCheckKeepsTheCanaryWhileTheStableIsShort(t *testing.T) {
 	w.run()
 	w.expect(v1.PhaseProgressing, 5, 5) // the stable settled: now the canary goes down to the step's count
 }
+
+// A failure limit lowered mid-step below the failures so far rolls back at the next decision, check or not: a step
+// never passes with more failed checks than the spec allows.
+func TestALoweredFailureLimitRollsBack(t *testing.T) {
+	w := newWorld(t, 10, step(10, 10*time.Minute)).withAnalysis(time.Minute, 2).started()
+	w.checks = func() analysis.Check { return failing }
+	w.settle()
+	w.run()
+	w.now = w.now.Add(time.Minute)
+	w.run()
+	if w.state.Phase != v1.PhaseProgressing || w.state.Analysis.FailedChecks != 1 {
+		t.Fatalf("state %+v; want one failure tolerated", w.state)
+	}
+	w.spec.Analysis.FailureLimit = ptr(int32(0))
+	w.now = w.now.Add(time.Second) // no check due
+	p := w.run()
+	if w.state.Phase != v1.PhaseRolledBack || w.checked != 1 || !strings.Contains(w.lastEvent(p, EventRolledBack), "1 of step 1 of 1 (10%)'s checks failed, more than the 0 allowed") {
+		t.Fatalf("state %+v, %d checks, events %+v", w.state, w.checked, p.Events)
+	}
+}
