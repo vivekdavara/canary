@@ -455,3 +455,77 @@ func TestTheDeadlineIsNeverEarlyWithTimesInSeconds(t *testing.T) {
 		t.Fatalf("state %+v; rolled back 59.6s into a 60s deadline", w.state)
 	}
 }
+
+// A rollback whose status write was lost, then the stable deleted: by the deadline (the status says it all) or by a
+// failed check (the check is due again and runs first), the rollback is recorded, nothing is created, and the status
+// is the rollback's: no canary revision, no pause or wait, the failures counted, a Warning.
+func TestADeletedStableAfterAnUnrecordedRollback(t *testing.T) {
+	for _, byCheck := range []bool{false, true} {
+		w := newWorld(t, 4, step(25, time.Hour)).withDeadline(60).withAnalysis(time.Second, 0).started()
+		if byCheck {
+			w.checks = func() analysis.Check { return failing }
+			w.settle()
+			w.run()
+			w.now = w.state.StepStartedAt.Add(time.Second)
+		} else {
+			w.now = w.now.Add(time.Minute)
+		}
+		last := w.state
+		w.run()
+		w.state, w.warnings = last, nil // the write lost
+		w.stable = nil
+		w.now = w.now.Add(100 * time.Millisecond)
+		p := w.run()
+		st := w.state
+		if w.stable != nil || st.Phase != v1.PhaseRolledBack || st.RolledBackRevision != "r2" || st.CanaryRevision != "" ||
+			st.StepStartedAt != nil || st.StepWaitingSince != nil || p.Reason != ReasonRolledBack {
+			t.Fatalf("by check %v: stable %+v, state %+v, plan %+v; want the rollback recorded, nothing created", byCheck, w.stable, st, p)
+		}
+		want := []string{EventRolledBack}
+		if byCheck {
+			want = []string{EventAnalysisFailed, EventRolledBack}
+			if st.Analysis.FailedChecks != 1 || p.Checked == nil || p.Checked.Passed {
+				t.Fatalf("analysis %+v, checked %+v; want the failed check counted and reported", st.Analysis, p.Checked)
+			}
+		}
+		if !slices.Equal(w.warnings, want) {
+			t.Fatalf("by check %v: warnings %v; want %v", byCheck, w.warnings, want)
+		}
+	}
+}
+
+// Day 2's rule still holds where the status doesn't say the rollout failed: a deleted stable is recreated from the
+// template. A status past its deadline for another revision than the template's (the template changed since), a
+// failure within the limit, and a due check that passes don't roll anything back.
+func TestADeletedStableWithNoFailureIsRecreated(t *testing.T) {
+	expectRecreated := func(w *world, rev string) {
+		t.Helper()
+		w.stable = nil
+		w.run()
+		if w.stable == nil || w.stable.Revision != rev || w.state.Phase != v1.PhaseHealthy || slices.Contains(w.warnings, EventRolledBack) {
+			t.Fatalf("stable %+v, state %+v, warnings %v; want the stable recreated at %s", w.stable, w.state, w.warnings, rev)
+		}
+	}
+	w := newWorld(t, 4, step(25, 0)).withDeadline(60).started()
+	w.now = w.now.Add(time.Minute) // r2's deadline is past, but nobody looked
+	w.rev = "r3"
+	expectRecreated(w, "r3")
+
+	w = newWorld(t, 4, step(25, time.Hour)).withAnalysis(time.Minute, 1).started()
+	w.checks = func() analysis.Check { return failing }
+	w.settle()
+	w.run()
+	w.now = w.now.Add(time.Minute)
+	w.run() // one failure, tolerated
+	w.now = w.now.Add(time.Second)
+	expectRecreated(w, "r2")
+
+	w = newWorld(t, 4, step(25, time.Hour)).withAnalysis(time.Minute, 0).started()
+	w.settle()
+	w.run()
+	w.now = w.now.Add(time.Minute) // a check is due, and passes
+	expectRecreated(w, "r2")
+	if w.checked != 1 {
+		t.Fatalf("%d checks; want the due one run first", w.checked)
+	}
+}

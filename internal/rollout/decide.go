@@ -193,18 +193,54 @@ func decide(in Input) Plan {
 	// lost, or a deadline that passed while the operator wasn't running. Recreating the stable from the template would
 	// run the failed version at all replicas, so the rollback is recorded and nothing is created (the hold above
 	// follows). Found by the review of day 3.
+	//
+	// The status can't show a rollback decided by a failed check whose status write was lost: only that the check is
+	// due again. So a due check runs first (the two calls of the normal path), and decides (the review's second round).
 	if stable == nil {
-		if why, failed := alreadyFailed(in); failed {
+		failedChecks := last.Analysis.FailedChecks
+		var checked *CheckResult
+		var events []Event
+		if a := in.Spec.Analysis; a != nil && last.Phase == v1.PhaseProgressing && last.CanaryRevision == rev &&
+			last.StepStartedAt != nil && canary != nil && canary.Revision == rev {
+			i := stepIndex(last.CurrentStep, in.Spec)
+			next := last.StepStartedAt.Add(intervalOf(a))
+			if last.Analysis.LastCheckAt != nil {
+				next = last.Analysis.LastCheckAt.Add(intervalOf(a))
+			}
+			if !in.Now.Before(next) {
+				if in.Check == nil {
+					return Plan{
+						Canary:      Target{Replicas: replicasOf(canary)},
+						State:       last,
+						Reason:      ReasonStepPaused,
+						Message:     fmt.Sprintf("the stable Deployment is gone: checking revision %s before recreating it from the template", rev),
+						AnalysisDue: true,
+					}
+				}
+				msg := fmt.Sprintf("%s, check %d", stepName(in.Spec, i), last.Analysis.Checks+1)
+				if in.Check.Passed() {
+					checked = &CheckResult{Passed: true, Message: msg + " passed: " + in.Check.String()}
+				} else {
+					failedChecks++
+					msg += fmt.Sprintf(" failed (%d failed, %d allowed): %s", failedChecks, failureLimitOf(a), in.Check.String())
+					checked = &CheckResult{Message: msg}
+					events = append(events, Event{Reason: EventAnalysisFailed, Message: msg, Warning: true})
+				}
+			}
+		}
+		if why, failed := alreadyFailed(in, failedChecks); failed {
 			st := last
 			st.Phase, st.RolledBackRevision, st.CanaryRevision = v1.PhaseRolledBack, rev, ""
 			st.StepStartedAt, st.StepWaitingSince = nil, nil
+			st.Analysis.FailedChecks = failedChecks
 			return Plan{
 				Canary:  Target{Replicas: replicasOf(canary)},
 				State:   st,
 				Reason:  ReasonRolledBack,
 				Message: fmt.Sprintf("revision %s was rolled back (%s), and the stable Deployment is gone: set the template to the version to run", rev, why),
-				Events: []Event{{Reason: EventRolledBack, Warning: true,
-					Message: fmt.Sprintf("revision %s rolled back: %s; the stable Deployment is gone", rev, why)}},
+				Events: append(events, Event{Reason: EventRolledBack, Warning: true,
+					Message: fmt.Sprintf("revision %s rolled back: %s; the stable Deployment is gone", rev, why)}),
+				Checked: checked,
 			}
 		}
 	}
@@ -568,17 +604,18 @@ func ceilSecond(t time.Time) time.Time {
 
 func ptr[T any](v T) *T { return &v }
 
-// alreadyFailed says whether a rollout in progress has failed by what its last status says alone: its step's
-// progress deadline is past with the step's canary pods still not ready, or its pause has more failed checks than the
-// limit allows. It is for a decision that can't go through the step (the stable is gone).
-func alreadyFailed(in Input) (string, bool) {
+// alreadyFailed says whether a rollout in progress has failed by what its last status says, with failedChecks for its
+// pause's failed checks (the status's, plus one if a check just failed): its step's progress deadline is past with the
+// step's canary pods still not ready, or its pause has more failed checks than the limit allows. It is for a decision
+// that can't go through the step (the stable is gone).
+func alreadyFailed(in Input, failedChecks int32) (string, bool) {
 	last := in.Status
 	if last.Phase != v1.PhaseProgressing || last.CanaryRevision != in.Revision {
 		return "", false
 	}
 	i := stepIndex(last.CurrentStep, in.Spec)
-	if a := in.Spec.Analysis; a != nil && last.StepStartedAt != nil && last.Analysis.FailedChecks > failureLimitOf(a) {
-		return fmt.Sprintf("%d of %s's checks failed, more than the %d allowed", last.Analysis.FailedChecks, stepName(in.Spec, i), failureLimitOf(a)), true
+	if a := in.Spec.Analysis; a != nil && last.StepStartedAt != nil && failedChecks > failureLimitOf(a) {
+		return fmt.Sprintf("%d of %s's checks failed, more than the %d allowed", failedChecks, stepName(in.Spec, i), failureLimitOf(a)), true
 	}
 	c, _ := Split(in.Spec.Replicas, in.Spec.Steps[i].Weight)
 	if last.StepStartedAt == nil && last.StepWaitingSince != nil && !in.Canary.readyAt(in.Revision, c) &&
