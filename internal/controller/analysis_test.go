@@ -12,6 +12,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	eventsv1 "k8s.io/api/events/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -340,4 +341,50 @@ func TestACheckCutShortByAShutdownIsNoVerdict(t *testing.T) {
 	if writes.load() != counts || after.Status.Phase != rolloutsv1alpha1.PhaseProgressing || after.Status.Analysis != nil {
 		t.Fatalf("writes %v -> %v, status %+v; want nothing written", counts, writes.load(), after.Status)
 	}
+}
+
+// An AnalysisFailed note with ten long metric errors is over the 1 KiB the API allows an Event's note: it is cut, so
+// the Event is recorded (uncut, the API server refuses it and the Event is lost), with the action Analyze; the
+// AnalysisPassing message is cut to the same length.
+func TestALongCheckReportIsCut(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"status":"error","errorType":"bad_data","error":%q}`, strings.Repeat("unexpected character in the query ", 12))
+	}))
+	t.Cleanup(srv.Close)
+	q, err := analysis.NewPrometheus(srv.URL, srv.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runOperatorWith(t, operatorOptions{querier: q})
+	c := testenv.Get(t).Client
+	ns := testenv.Get(t).Namespace(t)
+	ro := analysedRollout(ns, time.Hour, 0)
+	maxRate := 0.01
+	ro.Spec.Analysis.Metrics = nil
+	for i := range 10 {
+		ro.Spec.Analysis.Metrics = append(ro.Spec.Analysis.Metrics, rolloutsv1alpha1.Metric{
+			Name: fmt.Sprintf("metric-%d-%s", i, strings.Repeat("x", 50)), Query: "up", Max: &maxRate,
+		})
+	}
+	key, _, _ := startCanary(t, c, ro)
+	got := eventually(t, c, key, phase(rolloutsv1alpha1.PhaseRolledBack))
+	if ap := condition(got, ConditionAnalysisPassing); ap == nil || len(ap.Message) > maxMessage || len(ap.Message) < maxMessage-300 {
+		t.Fatalf("AnalysisPassing %+v; want the message cut to at most %d bytes", ap, maxMessage)
+	}
+	var list eventsv1.EventList
+	for range poll(t) {
+		if err := c.List(context.Background(), &list, client.InNamespace(ns)); err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range list.Items {
+			if e.Reason == rollout.EventAnalysisFailed {
+				if len(e.Note) > maxMessage || !strings.Contains(e.Note, "the query failed: Prometheus: bad_data") || e.Action != "Analyze" || e.Type != "Warning" {
+					t.Fatalf("AnalysisFailed: action %q, type %q, note of %d bytes: %q", e.Action, e.Type, len(e.Note), e.Note)
+				}
+				return
+			}
+		}
+	}
+	t.Fatalf("no AnalysisFailed Event: %d Events", len(list.Items))
 }

@@ -438,3 +438,20 @@ func TestADeletedStableAfterTheDeadlineWithTheCanaryReady(t *testing.T) {
 		t.Fatalf("state %+v, stable %+v, warnings %v; want the stable recreated from the template, no rollback", w.state, w.stable, w.warnings)
 	}
 }
+
+// The API server stores status times to the second, so the wait's start is rounded up: a deadline is never early.
+// Here the wait begins at 10:00:00.5; stored rounded down it would end the 60s deadline at 10:01:00, 0.5s early.
+func TestTheDeadlineIsNeverEarlyWithTimesInSeconds(t *testing.T) {
+	w := newWorld(t, 4, step(25, 0)).withDeadline(60)
+	w.run()
+	w.settle()
+	w.now = w.now.Add(500 * time.Millisecond)
+	w.rev = "r2"
+	w.run()
+	w.state = truncateTimes(w.state) // written and read back
+	w.now = w.now.Add(59600 * time.Millisecond)
+	w.run()
+	if w.state.Phase != v1.PhaseProgressing {
+		t.Fatalf("state %+v; rolled back 59.6s into a 60s deadline", w.state)
+	}
+}
