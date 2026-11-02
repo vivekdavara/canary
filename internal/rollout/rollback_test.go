@@ -322,3 +322,34 @@ func TestADueCheckHoldsTheStep(t *testing.T) {
 		t.Fatalf("plan %+v; want the step held with a check due", p)
 	}
 }
+
+// A 1s interval checks about every second even when reconciles come a fraction late: each check's time is kept rounded
+// down to the second (as the API server stores it), so the next is never pushed later. A 3s pause gets three checks.
+func TestASecondIntervalChecksEverySecond(t *testing.T) {
+	w := newWorld(t, 2, step(50, 3*time.Second)).withAnalysis(time.Second, 0).started()
+	w.now = w.now.Add(300 * time.Millisecond)
+	w.settle()
+	w.run() // the pause starts at the next whole second
+	start := w.state.StepStartedAt.Time
+	for _, late := range []time.Duration{1300, 2050, 3000} {
+		w.now = start.Add(late * time.Millisecond)
+		w.run()
+	}
+	if w.checked != 3 || w.state.Phase != v1.PhasePromoting {
+		t.Fatalf("%d checks, state %+v; want 3 and the step passed", w.checked, w.state)
+	}
+}
+
+// While the rollout holds after a rollback, its plan asks to keep the Progressing message, which says why it rolled
+// back; the rollback's own plan carries that message.
+func TestTheHoldKeepsTheRollbacksMessage(t *testing.T) {
+	w := newWorld(t, 4, step(25, 0)).withDeadline(60).started()
+	w.now = w.now.Add(time.Minute)
+	p := w.run()
+	if p.KeepMessage || !strings.Contains(p.Message, "wasn't ready within the progress deadline of 1m0s") {
+		t.Fatalf("rollback plan %+v; want the deadline in its message", p)
+	}
+	if p = w.run(); !p.KeepMessage || p.Reason != ReasonRolledBack {
+		t.Fatalf("hold plan %+v; want KeepMessage", p)
+	}
+}

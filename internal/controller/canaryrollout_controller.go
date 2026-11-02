@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -26,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	rolloutsv1alpha1 "github.com/vivekdavara/canary/api/v1alpha1"
+	"github.com/vivekdavara/canary/internal/analysis"
 	"github.com/vivekdavara/canary/internal/revision"
 	"github.com/vivekdavara/canary/internal/rollout"
 )
@@ -33,8 +35,9 @@ import (
 // Condition types and the reasons the operator gives (DESIGN.md, "Status"). The Progressing condition's other
 // reasons are the state machine's (internal/rollout).
 const (
-	ConditionProgressing = "Progressing"
-	ConditionAvailable   = "Available"
+	ConditionProgressing     = "Progressing"
+	ConditionAvailable       = "Available"
+	ConditionAnalysisPassing = "AnalysisPassing"
 
 	// ReasonInvalidSpec: the stored rollout can't be decoded, or the API server refused a Deployment built from its
 	// template.
@@ -45,7 +48,11 @@ const (
 	ReasonEnoughPods      = "EnoughPodsReady"
 	ReasonNotEnoughPods   = "NotEnoughPodsReady"
 	eventActionRollout    = "Rollout"
+	eventActionAnalysis   = "Analyze"
 	eventActionValidation = "Validate"
+
+	// DefaultAnalysisTimeout bounds each analysis query when AnalysisTimeout isn't set.
+	DefaultAnalysisTimeout = 10 * time.Second
 )
 
 // CanaryRolloutReconciler reconciles CanaryRollouts.
@@ -57,6 +64,12 @@ type CanaryRolloutReconciler struct {
 	Recorder events.EventRecorder
 	// Now is the clock; time.Now when nil. Tests set it.
 	Now func() time.Time
+	// Querier answers the analysis's queries (a Prometheus, from --prometheus-url). Nil fails every check of a rollout
+	// with analysis: an analysis that can't measure doesn't pass.
+	Querier analysis.Querier
+	// AnalysisTimeout bounds each query; DefaultAnalysisTimeout when 0. Reconciles run one at a time, so a slow
+	// Prometheus holds up the other rollouts by up to this much per check.
+	AnalysisTimeout time.Duration
 }
 
 // New returns the reconciler for mgr.
@@ -128,20 +141,34 @@ func (r *CanaryRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 }
 
 func (r *CanaryRolloutReconciler) reconcile(ctx context.Context, ro *rolloutsv1alpha1.CanaryRollout, rev string, stable, canary *appsv1.Deployment) (ctrl.Result, error) {
-	plan := rollout.Decide(rollout.Input{
+	in := rollout.Input{
 		Spec:     &ro.Spec,
 		Revision: rev,
 		Status: rollout.State{
-			Phase:          ro.Status.Phase,
-			StableRevision: ro.Status.StableRevision,
-			CanaryRevision: ro.Status.CanaryRevision,
-			CurrentStep:    ro.Status.CurrentStep,
-			StepStartedAt:  ro.Status.StepStartedAt,
+			Phase:              ro.Status.Phase,
+			StableRevision:     ro.Status.StableRevision,
+			CanaryRevision:     ro.Status.CanaryRevision,
+			RolledBackRevision: ro.Status.RolledBackRevision,
+			CurrentStep:        ro.Status.CurrentStep,
+			StepStartedAt:      ro.Status.StepStartedAt,
+			StepWaitingSince:   ro.Status.StepWaitingSince,
+			Analysis:           analysisState(ro.Status.Analysis),
 		},
 		Stable: observe(stable),
 		Canary: observe(canary),
 		Now:    r.now(),
-	})
+	}
+	plan := rollout.Decide(in)
+	if plan.AnalysisDue {
+		// A check is due: run it, and decide again from the same input (the same clock reading) with its result.
+		timeout := r.AnalysisTimeout
+		if timeout == 0 {
+			timeout = DefaultAnalysisTimeout
+		}
+		check := analysis.Run(ctx, r.Querier, ro.Spec.Analysis.Metrics, timeout)
+		in.Check = &check
+		plan = rollout.Decide(in)
+	}
 	for _, w := range []struct {
 		track  string
 		cur    *appsv1.Deployment
@@ -169,8 +196,11 @@ func (r *CanaryRolloutReconciler) reconcile(ctx context.Context, ro *rolloutsv1a
 	want.Phase = plan.State.Phase
 	want.StableRevision = plan.State.StableRevision
 	want.CanaryRevision = plan.State.CanaryRevision
+	want.RolledBackRevision = plan.State.RolledBackRevision
 	want.CurrentStep = plan.State.CurrentStep
 	want.StepStartedAt = plan.State.StepStartedAt
+	want.StepWaitingSince = plan.State.StepWaitingSince
+	want.Analysis = analysisStatus(plan.State.Analysis)
 	// Ready pods as read, before this reconcile's writes: the writes' effects come back as Deployment events.
 	want.StableReplicas, want.CanaryReplicas = readyOf(stable), readyOf(canary)
 	want.CanaryWeight = rollout.Weight(want.CanaryReplicas, want.StableReplicas)
@@ -178,10 +208,25 @@ func (r *CanaryRolloutReconciler) reconcile(ctx context.Context, ro *rolloutsv1a
 	if plan.Progressing() {
 		progressing = metav1.ConditionTrue
 	}
+	msg := truncate(plan.Message)
+	if c := meta.FindStatusCondition(want.Conditions, ConditionProgressing); plan.KeepMessage && c != nil && c.Reason == plan.Reason {
+		msg = c.Message // why the rollout rolled back, written when it did
+	}
 	meta.SetStatusCondition(&want.Conditions, metav1.Condition{
-		Type: ConditionProgressing, Status: progressing, Reason: plan.Reason, Message: plan.Message, ObservedGeneration: ro.Generation,
+		Type: ConditionProgressing, Status: progressing, Reason: plan.Reason, Message: msg, ObservedGeneration: ro.Generation,
 	})
 	meta.SetStatusCondition(&want.Conditions, available(ro, want))
+	// AnalysisPassing says how the last check went; it is written when a check runs, and otherwise left as it was.
+	if c := plan.Checked; c != nil {
+		cond := metav1.Condition{
+			Type: ConditionAnalysisPassing, Status: metav1.ConditionTrue, Reason: rollout.ReasonChecksPassed,
+			Message: truncate(c.Message), ObservedGeneration: ro.Generation,
+		}
+		if !c.Passed {
+			cond.Status, cond.Reason = metav1.ConditionFalse, rollout.ReasonCheckFailed
+		}
+		meta.SetStatusCondition(&want.Conditions, cond)
+	}
 	written, err := r.writeStatus(ctx, ro, want)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -190,12 +235,35 @@ func (r *CanaryRolloutReconciler) reconcile(ctx context.Context, ro *rolloutsv1a
 	// from the same last status and would repeat them.
 	if written {
 		for _, e := range plan.Events {
-			r.Recorder.Eventf(ro, nil, corev1.EventTypeNormal, e.Reason, eventActionRollout, "%s", e.Message)
+			typ, action := corev1.EventTypeNormal, eventActionRollout
+			if e.Warning {
+				typ = corev1.EventTypeWarning
+			}
+			if e.Reason == rollout.EventAnalysisFailed {
+				action = eventActionAnalysis
+			}
+			// An Event's note is limited to 1 KiB; a longer one would be refused, and the Event lost.
+			r.Recorder.Eventf(ro, nil, typ, e.Reason, action, "%s", truncate(e.Message))
 		}
 	}
 	// The requeue goes back even when nothing was written: the reconcile the status write itself causes finds nothing
 	// to write, and it must still ask to be woken at the pause's end.
 	return ctrl.Result{RequeueAfter: plan.RequeueAfter}, nil
+}
+
+// analysisState and analysisStatus convert the step's check counts between the status and the state machine.
+func analysisState(a *rolloutsv1alpha1.AnalysisStatus) rollout.Analysis {
+	if a == nil {
+		return rollout.Analysis{}
+	}
+	return rollout.Analysis{Checks: a.Checks, FailedChecks: a.FailedChecks, LastCheckAt: a.LastCheckAt}
+}
+
+func analysisStatus(a rollout.Analysis) *rolloutsv1alpha1.AnalysisStatus {
+	if a == (rollout.Analysis{}) {
+		return nil
+	}
+	return &rolloutsv1alpha1.AnalysisStatus{Checks: a.Checks, FailedChecks: a.FailedChecks, LastCheckAt: a.LastCheckAt}
 }
 
 // available is True when the ready pods of both Deployments add up to spec.replicas.
@@ -214,9 +282,7 @@ func available(ro *rolloutsv1alpha1.CanaryRollout, st *rolloutsv1alpha1.CanaryRo
 // reportStuck records why the rollout can't go on (Progressing False with reason and message) and a Warning Event,
 // and leaves the rest of the status, and the Deployments, as they were.
 func (r *CanaryRolloutReconciler) reportStuck(ctx context.Context, ro *rolloutsv1alpha1.CanaryRollout, rev, reason, msg string) error {
-	if len(msg) > maxMessage {
-		msg = msg[:maxMessage]
-	}
+	msg = truncate(msg)
 	want := ro.Status.DeepCopy()
 	want.ObservedGeneration = ro.Generation
 	want.UpdateRevision = rev
@@ -262,8 +328,21 @@ func readyOf(d *appsv1.Deployment) int32 {
 	return d.Status.ReadyReplicas
 }
 
-// maxMessage bounds a condition message built from an error (the API allows 32768 bytes).
+// maxMessage bounds condition messages and Event notes: an Event's note may be at most 1 KiB (a condition's message
+// 32 KiB).
 const maxMessage = 1024
+
+// truncate cuts s to maxMessage bytes, at a rune's start, so the message stays valid UTF-8.
+func truncate(s string) string {
+	if len(s) <= maxMessage {
+		return s
+	}
+	i := maxMessage
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	return s[:i]
+}
 
 // reportUndecodable records on the rollout's own status that it can't be decoded, without decoding the rest of it:
 // observedGeneration and a Progressing condition, False with reason InvalidSpec. The operator then leaves the rollout
@@ -279,10 +358,7 @@ func (r *CanaryRolloutReconciler) reportUndecodable(ctx context.Context, u *unst
 			return fmt.Errorf("decoding the status of an undecodable rollout: %w", err)
 		}
 	}
-	msg := "the rollout can't be decoded: " + decodeErr.Error()
-	if len(msg) > maxMessage {
-		msg = msg[:maxMessage]
-	}
+	msg := truncate("the rollout can't be decoded: " + decodeErr.Error())
 	changed := meta.SetStatusCondition(&st.Conditions, metav1.Condition{
 		Type:               ConditionProgressing,
 		Status:             metav1.ConditionFalse,

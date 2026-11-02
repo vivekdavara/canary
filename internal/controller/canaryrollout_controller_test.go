@@ -21,6 +21,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	rolloutsv1alpha1 "github.com/vivekdavara/canary/api/v1alpha1"
+	"github.com/vivekdavara/canary/internal/analysis"
 	"github.com/vivekdavara/canary/internal/revision"
 	"github.com/vivekdavara/canary/internal/testenv"
 )
@@ -52,6 +53,10 @@ func runOperatorWithClock(t *testing.T, now func() time.Time) (stop func()) {
 type operatorOptions struct {
 	now   func() time.Time   // the reconciler's clock; time.Now when nil
 	funcs *interceptor.Funcs // when set, the manager's client goes through these (to count or fail calls)
+	// querier answers the analysis's queries (nil: none, as without --prometheus-url), each bounded by
+	// analysisTimeout (the default when 0).
+	querier         analysis.Querier
+	analysisTimeout time.Duration
 }
 
 func runOperatorWith(t *testing.T, opts operatorOptions) (stop func()) {
@@ -83,7 +88,7 @@ func runOperatorWith(t *testing.T, opts operatorOptions) (stop func()) {
 		t.Fatal(err)
 	}
 	r := New(mgr)
-	r.Now = opts.now
+	r.Now, r.Querier, r.AnalysisTimeout = opts.now, opts.querier, opts.analysisTimeout
 	if err := r.SetupWithManager(mgr); err != nil {
 		t.Fatal(err)
 	}

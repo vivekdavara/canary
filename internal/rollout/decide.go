@@ -128,6 +128,9 @@ type Plan struct {
 	// rollout and its Deployments bring reconciles of their own.
 	RequeueAfter time.Duration
 	Events       []Event
+	// KeepMessage says the Progressing condition keeps the message it has if its reason is already Reason: a rollout
+	// that rolled back keeps the message that says why while it holds, and Message is for when it has none.
+	KeepMessage bool
 	// AnalysisDue says a check is due: the operator runs one and decides again from the same input with its result
 	// (Input.Check). The rest of such a plan is safe to carry out as it is (the step holds), but it isn't meant to be.
 	AnalysisDue bool
@@ -322,7 +325,10 @@ func decide(in Input) Plan {
 				due = true
 			} else {
 				st.Analysis.Checks++
-				st.Analysis.LastCheckAt = &metav1.Time{Time: ceilSecond(in.Now)}
+				// Rounded down, to the second the API server stores: the next check is then due an interval after it,
+				// never later. Rounded up, every check would be up to a second late, and a 1s interval would check
+				// every 2s.
+				st.Analysis.LastCheckAt = &metav1.Time{Time: in.Now.Truncate(time.Second)}
 				nextCheck = st.Analysis.LastCheckAt.Add(intervalOf(a))
 				msg := fmt.Sprintf("%s, check %d", stepName(in.Spec, i), st.Analysis.Checks)
 				if in.Check.Passed() {
@@ -444,6 +450,7 @@ func rollBack(in Input, st State, why string, events []Event) Plan {
 	st.CanaryRevision = ""
 	st.StepStartedAt, st.StepWaitingSince = nil, nil
 	p := holdBack(in, st, why)
+	p.KeepMessage = false // this message says why; the hold keeps it
 	p.Events = append(events, Event{
 		Reason:  EventRolledBack,
 		Message: fmt.Sprintf("revision %s rolled back: %s; the stable runs revision %s", in.Revision, why, in.Stable.Revision),
@@ -472,11 +479,12 @@ func holdBack(in Input, st State, why string) Plan {
 		msg += fmt.Sprintf(", and the canary keeps its %d pods until the stable's %d are ready", keep, r)
 	}
 	return Plan{
-		Stable:  Target{Replicas: r},
-		Canary:  Target{Replicas: keep},
-		State:   st,
-		Reason:  ReasonRolledBack,
-		Message: msg + "; change the template to roll out another version",
+		Stable:      Target{Replicas: r},
+		Canary:      Target{Replicas: keep},
+		State:       st,
+		Reason:      ReasonRolledBack,
+		Message:     msg + "; change the template to roll out another version",
+		KeepMessage: true,
 	}
 }
 
