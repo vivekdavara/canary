@@ -457,6 +457,14 @@ many failures) and the stable is gone, the rollback is recorded and nothing is c
 then failing every query, and a partial answer (`success` with warnings) passing. And five mechanisms no test caught,
 each with a test now.
 
+**And the second round?**
+It reviewed my fixes only, and found two problems in them. Switching `lastCheckAt` to a `MicroTime` broke decoding
+of the times the operator wrote before (to the second): a rollout mid-pause would have become undecodable after an
+upgrade, stuck as `InvalidSpec`. The reconciler now rewrites that field to microseconds before decoding
+(`repairCheckTime`). And my deleted-stable fix only covered failures the status shows; a rollback by a failed check
+whose write was lost shows only as a check due again, so with the stable gone a due check now runs first. Lesson: a
+change of a stored field's type is a migration, even on an unreleased field, if anything already wrote it.
+
 **Why didn't your own walk find the deleted-stable case?**
 It never deleted a Deployment: I wrote it for analysis and the deadline, and left deletions to day 2's walk, which has
 no analysis. The review's walk combines them, and it's in the repository now (`review_d3_walk_test.go`).
@@ -471,7 +479,8 @@ no analysis. The review's walk combines them, and it's in the repository now (`r
 - I compared the failure limit only after a failed check, so lowering it mid-step didn't count; and a shutdown
   mid-check counted as a failed check. Both found while reading the code, both fixed with tests.
 - A deleted stable after a lost rollback write (the review's medium finding): my walks never combined deletions with
-  analysis.
+  analysis. My fix then covered only the deadline, and changing `lastCheckAt`'s type broke decoding of times already
+  stored (the second round's findings).
 
 ## What went wrong on day 2
 

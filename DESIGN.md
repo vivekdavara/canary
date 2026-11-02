@@ -333,7 +333,7 @@ below `min` or above `max`, NaN or infinite, an empty vector, more than one samp
 native-histogram sample, an API error (`bad_data`, `timeout`, ...), an answer that isn't the API's (a proxy's HTML
 error page), a success with an HTTP error code, a success with warnings (the answer may be partial: Thanos, Cortex and
 Mimir answer "success" with the series they could get when a store is down, which can leave out exactly the failing
-series; PromQL's `PromQL info:` annotations are ignored), an answer over 1 MiB, a refused connection, or no answer
+series; PromQL's `PromQL info:` annotations are ignored), an answer marked `"isPartial": true` (VictoriaMetrics' way), an answer over 1 MiB, a refused connection, or no answer
 within the operator's `--analysis-timeout` (10s by default). An analysis that can't measure doesn't pass: it fails closed.
 Without `--prometheus-url` every check fails, with a message naming the flag. A **check** runs every metric once (in
 parallel) and passes when all of them pass (`internal/analysis`: `Evaluate` is the verdict, `Run` the check,
@@ -358,6 +358,13 @@ to a second late, and a 1s interval checked every 2s (an envtest test found it);
 that ran 0.9s late was recorded 0.9s early, so a reconcile 100 ms later ran another, and one bad moment counted twice
 (the review found it). Pause starts and the deadline's start stay `Time`s, rounded up: there a second late is
 harmless and a second early is not.
+
+A `MicroTime` decodes only with exactly six fractional digits, while the CRD's schema accepts any RFC 3339 time, and
+the operator before this change wrote `lastCheckAt` to the second. So before decoding a rollout the reconciler checks
+that one field and, if it is in another form, rewrites it to the same instant in microseconds with a raw JSON merge
+patch (removing a value that doesn't parse at all) and returns; the patch brings the next reconcile. Without that, a
+rollout mid-pause would have been undecodable after an upgrade, `InvalidSpec` for good (the second review round found
+it; `TestAStoredCheckTimeInAnotherFormIsRepaired`).
 
 The checks start over with the pause: an edit that restarts a step's pause (its pods change) also clears its checks
 and failures. `analysis.failureLimit` is read at every decision during a pause: more failed checks than the limit
@@ -412,8 +419,10 @@ Rules, and why:
   deadline past with the step's pods still not ready, or more failed checks than the limit) and the stable is gone,
   the rollback is recorded and nothing is created. That is a rollback whose status write was lost, or a deadline that
   passed while the operator wasn't running, followed by the stable's deletion; day 2's rule would have recreated the
-  stable from the failed template at all replicas (the review found it). Pods that became ready late still count: the
-  step then starts, as on the normal path, and a deleted stable is recreated from the template as on day 2.
+  stable from the failed template at all replicas (the review found it). A rollback decided by a failed check leaves
+  no trace in a lost status write but a check due again, so with the stable gone mid-pause a due check runs first
+  (the same two calls) and decides (the second round found that). Pods that became ready late still count: the step
+  then starts, as on the normal path, and a deleted stable is recreated from the template as on day 2.
 - **A rollback whose status write is lost is decided again.** The Deployments are written first, so the stable may
   already be back at `replicas`. The next decision rolls back again if the deadline is still past; after a failed
   check, a new check runs, and if that one passes the rollout carries on and the stable comes back down to the step's

@@ -142,7 +142,7 @@ play its part: they write a Deployment's status (`markReady`) when its pods woul
 | `internal/analysis/prometheus_test.go` (unit) | the client against canned API responses: a scalar, one sample, two, none, a matrix, warnings, NaN and ±Inf; each error (`bad_data`, `timeout`, a proxy's HTML page, an empty envelope, a success with a 500, a histogram sample, a bad value, a value that isn't a string, a short sample, an answer over 1 MiB); a hung server and a closed one; the URL's validation |
 | `internal/rollout/rollback_test.go` (unit) | the deadline (rolls back on its exact second; per step), a rollback with the stable down (the canary kept until the stable is back), checks every interval (four in a 2m pause at 30s), a pause shorter than the interval, the failure limit (failures tolerated, then the rollback, each a Warning), checks starting over with the pause, a deleted stable after a rollback (not recreated from the failed template), template changes after a rollback, a lost rollback write, a due check holding the step, a 1s interval with late reconciles, the hold keeping the rollback's message, a lowered limit, the walk's capacity case |
 | `internal/rollout/walk_analysis_test.go` (unit) | 4,000 random walks with checks passing or failing at random, the deadline, slow and lost pods, lost status writes, new templates, `replicas` and `failureLimit` edits; after every decision: capacity, a rollback never touching the stable's template, a held rollout never growing the canary or promoting the rolled-back revision, a step passing only after a check and within the limit, the status consistent; every walk ends `Healthy` or held after its rollback; a census makes sure each case happens at least 300 times |
-| `internal/rollout/review_d3_*_test.go`, `internal/analysis/review_d3_prometheus_test.go` (unit) | the day 3 review's findings, as it wrote them, and its walk (`TestReviewD3Walks`, 6,000 walks with deletions, edits of every analysis field, analysis removed and added, and status times stored to the second) |
+| `internal/rollout/review_d3_*_test.go`, `internal/analysis/review_d3_prometheus_test.go` (unit); `review_d3b_*_test.go` (the second round's, one of them envtest) | the day 3 reviews' findings, as they wrote them, and the first round's walk (`TestReviewD3Walks`, 6,000 walks with deletions, edits of every analysis field, analysis removed and added, and status times stored to the second) |
 | `internal/controller/analysis_test.go` | through the real HTTP client and a fake Prometheus API: a passing analysis promotes (3 checks in a 3 s pause at 1 s), a failing one rolls back (Warning Events, both conditions, the stable back, the canary drained, no more queries), the progress deadline rolls back on its requeue, no Prometheus fails closed, a hung Prometheus fails at the timeout; a rolled-back rollout's writes counted, and none in the hold |
 | `internal/controller/undecodable_test.go` | a rollout with a probe port beyond int32 (accepted, undecodable) gets `InvalidSpec` on its own status while another rollout keeps being reconciled |
 | `internal/controller/rollout_test.go` (`TestARolloutsWrites`) | a whole rollout's writes counted at the operator's own client, and none in the two seconds after it ends: a guard against a reconcile that writes in a loop (a status carrying the time wrote 984 patches in those two seconds) |
@@ -273,7 +273,16 @@ template back to a rolled-back revision, and store status times to the second), 
 - **Low (arguable): a partial answer passed.** A "success" with warnings (a store down behind Thanos, Cortex or Mimir)
   may leave out the failing series. It fails the query now, except `PromQL info:` annotations.
 
-It also listed five mechanisms it could break with every test passing: the wait's start rounded up, `AnalysisFailed`'s
+A second agent, on those fixes (`2aa772f`, 17 minutes, `review_d3b_*`), found **a regression in my fix and a gap in
+another**: `lastCheckAt` as a `MicroTime` decodes only with six fractional digits, so a rollout mid-pause written by
+the operator before the change would have been undecodable after an upgrade, `InvalidSpec` for good (fixed,
+`69325da`: the reconciler rewrites such a time to microseconds before decoding); and the deleted-stable fix covered
+the deadline but not a rollback by a failed check whose write was lost, which leaves only a check due again (fixed,
+`237ba4f`: with the stable gone mid-pause, a due check runs first and decides). Also an answer marked `isPartial`
+(VictoriaMetrics) without warnings passed (fixed), and a day 1 test raced the operator's status writes (fixed,
+`d3b4ae2`). Five mutants of my round-1 branch survived; each fails a test now.
+
+The first agent also listed five mechanisms it could break with every test passing: the wait's start rounded up, `AnalysisFailed`'s
 action, the Event note and the `AnalysisPassing` message cut to 1 KiB, and the canary kept in a hold with the stable
 gone. Each has a test now and each mutant fails it (`2aa772f`); without the cut, the API server refuses the Event and
 it is lost. Its unreproduced suspicion, that a rolled-back canary's unready pods could hold a namespace's quota, is
