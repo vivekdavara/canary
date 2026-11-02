@@ -357,6 +357,13 @@ func decide(in Input) Plan {
 		if !canary.readyAt(rev, c) {
 			stableWant = max(s, stable.Replicas)
 		}
+		// A step held past its pause for its first check can have a canary with more pods than the step's (a pause
+		// over with more is kept, above), and the capacity rule of waitForCanary holds here too: the canary isn't
+		// scaled down until the stable is settled at its count.
+		canaryWant := c
+		if canary.Replicas > c && !(stable.Settled && stable.Replicas == stableWant) {
+			canaryWant = canary.Replicas
+		}
 		msg := fmt.Sprintf("%s: pods ready, paused until %s", stepName(in.Spec, i), end.UTC().Format(time.RFC3339))
 		wake := end
 		if a := in.Spec.Analysis; a != nil {
@@ -366,7 +373,7 @@ func decide(in Input) Plan {
 			}
 		}
 		return Plan{
-			Canary:       Target{Replicas: c, FromTemplate: true},
+			Canary:       Target{Replicas: canaryWant, FromTemplate: true},
 			Stable:       Target{Replicas: stableWant},
 			State:        st,
 			Reason:       ReasonStepPaused,

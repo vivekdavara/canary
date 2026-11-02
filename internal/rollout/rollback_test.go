@@ -353,3 +353,26 @@ func TestTheHoldKeepsTheRollbacksMessage(t *testing.T) {
 		t.Fatalf("hold plan %+v; want KeepMessage", p)
 	}
 }
+
+// Found by TestRandomWalksWithAnalysis: a step held past its 0s pause for its first check, after a replicas decrease
+// left the canary with more pods than the step's (11 -> 10 at 46%: 6 -> 5) while a stable pod was down. The hold
+// scaled the canary down at once, taking the ready pods from 10 to 9; it keeps them now until the stable is settled.
+func TestAStepHeldForItsCheckKeepsTheCanaryWhileTheStableIsShort(t *testing.T) {
+	w := newWorld(t, 11, step(46, 0), step(56, 0)).withAnalysis(30*time.Second, 0).started()
+	w.settle()
+	w.run() // the 0s pause is over at once, but the step waits for its first check
+	w.settle()
+	w.expect(v1.PhaseProgressing, 5, 6)
+	w.stable.ReadyReplicas, w.stable.Settled = 4, false
+	w.spec.Replicas = 10
+	if p := w.run(); p.Reason != ReasonStepPaused {
+		t.Fatalf("plan %+v; want still held for the check", p)
+	}
+	w.expect(v1.PhaseProgressing, 5, 6)
+	if ready := w.stable.ReadyReplicas + w.canary.ReadyReplicas; ready < 10 {
+		t.Fatalf("%d pods ready; want 10", ready)
+	}
+	w.settle()
+	w.run()
+	w.expect(v1.PhaseProgressing, 5, 5) // the stable settled: now the canary goes down to the step's count
+}

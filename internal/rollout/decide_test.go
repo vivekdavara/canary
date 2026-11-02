@@ -31,6 +31,8 @@ type world struct {
 	// checked counts the checks run; warnings lists the Warning Events' reasons, in order.
 	checked  int
 	warnings []string
+	prev     State          // the state before the current decision (TestRandomWalksWithAnalysis's messages)
+	before   [2]*Deployment // and the stable and canary
 }
 
 func newWorld(t *testing.T, replicas int32, steps ...v1.Step) *world {
