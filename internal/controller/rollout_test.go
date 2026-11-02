@@ -401,21 +401,8 @@ func TestADeletedDeploymentComesBack(t *testing.T) {
 // reconcile that writes in a loop (every status write is itself an event that brings another reconcile). After the
 // rollout ends, two quiet seconds must pass with no write at all.
 func TestARolloutsWrites(t *testing.T) {
-	var creates, updates, statusPatches atomic.Int32
-	runOperatorWith(t, operatorOptions{funcs: &interceptor.Funcs{
-		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-			creates.Add(1)
-			return c.Create(ctx, obj, opts...)
-		},
-		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-			updates.Add(1)
-			return c.Update(ctx, obj, opts...)
-		},
-		SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
-			statusPatches.Add(1)
-			return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
-		},
-	}})
+	var writes writeCounter
+	runOperatorWith(t, operatorOptions{funcs: writes.funcs()})
 	c := testenv.Get(t).Client
 	ns := testenv.Get(t).Namespace(t)
 	ro := newRollout(ns, "example.com/web:1") // 4 pods, steps of 25% and 50%, no pauses
@@ -442,11 +429,7 @@ func TestARolloutsWrites(t *testing.T) {
 		return r.Status.Phase == rolloutsv1alpha1.PhaseHealthy && r.Status.StableRevision == rev2 && r.Status.StableReplicas == 4 && r.Status.CanaryReplicas == 0
 	})
 
-	before := [3]int32{creates.Load(), updates.Load(), statusPatches.Load()}
-	time.Sleep(2 * time.Second)
-	if after := [3]int32{creates.Load(), updates.Load(), statusPatches.Load()}; after != before {
-		t.Fatalf("writes went on after the rollout ended: (creates, updates, status patches) %v, then %v", before, after)
-	}
+	before := writes.quiet(t, 2*time.Second)
 	t.Logf("a whole rollout (first apply, two steps, promotion): %d creates, %d Deployment updates, %d status patches", before[0], before[1], before[2])
 	// Creates: the two Deployments. Updates: the canary 1 -> 2, the stable's template, the canary to 0, the stable
 	// 4 -> 2 if a step's pods are ready before the next begins (with no pauses they may not be). Status: each
@@ -454,4 +437,39 @@ func TestARolloutsWrites(t *testing.T) {
 	if before[0] != 2 || before[1] > 6 || before[2] > 20 {
 		t.Errorf("(creates, updates, status patches) = %v; want 2, at most 6, at most 20", before)
 	}
+}
+
+// writeCounter counts the operator's writes at its own client: creates, updates and status patches.
+type writeCounter struct{ creates, updates, statusPatches atomic.Int32 }
+
+func (w *writeCounter) funcs() *interceptor.Funcs {
+	return &interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			w.creates.Add(1)
+			return c.Create(ctx, obj, opts...)
+		},
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			w.updates.Add(1)
+			return c.Update(ctx, obj, opts...)
+		},
+		SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			w.statusPatches.Add(1)
+			return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
+		},
+	}
+}
+
+func (w *writeCounter) load() [3]int32 {
+	return [3]int32{w.creates.Load(), w.updates.Load(), w.statusPatches.Load()}
+}
+
+// quiet returns the counts after checking that none changes for d: no reconcile writing in a loop.
+func (w *writeCounter) quiet(t *testing.T, d time.Duration) [3]int32 {
+	t.Helper()
+	before := w.load()
+	time.Sleep(d)
+	if after := w.load(); after != before {
+		t.Fatalf("writes went on: (creates, updates, status patches) %v, then %v %v later", before, after, d)
+	}
+	return before
 }

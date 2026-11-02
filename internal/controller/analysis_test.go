@@ -251,3 +251,39 @@ func TestASlowPrometheusFailsTheCheckAtTheTimeout(t *testing.T) {
 }
 
 func ptrTo[T any](v T) *T { return &v }
+
+// A rollout that fails its analysis, counted at the operator's own client: the numbers the README quotes. Three
+// failed checks a second apart (the limit allows two), the rollback, the drain; then the hold writes nothing and
+// queries nothing.
+func TestARolledBackRolloutsWrites(t *testing.T) {
+	prom, q := newFakePrometheus(t, "0.2")
+	var writes writeCounter
+	runOperatorWith(t, operatorOptions{querier: q, funcs: writes.funcs()})
+	c := testenv.Get(t).Client
+	ns := testenv.Get(t).Namespace(t)
+	key, stableRev, canaryRev := startCanary(t, c, analysedRollout(ns, time.Hour, 2))
+	deploymentWhen(t, c, ns, "web-stable", at(stableRev, 1))
+	markReady(t, c, ns, "web-stable")
+	got := eventually(t, c, key, phase(rolloutsv1alpha1.PhaseRolledBack))
+	if a := got.Status.Analysis; a == nil || a.Checks != 3 || a.FailedChecks != 3 {
+		t.Fatalf("analysis %+v; want 3 checks, all failed", a)
+	}
+	deploymentWhen(t, c, ns, "web-stable", at(stableRev, 2))
+	markReady(t, c, ns, "web-stable")
+	deploymentWhen(t, c, ns, "web-canary", at(canaryRev, 0))
+	markReady(t, c, ns, "web-canary")
+	eventually(t, c, key, func(r *rolloutsv1alpha1.CanaryRollout) bool {
+		return r.Status.CanaryReplicas == 0 && r.Status.StableReplicas == 2
+	})
+
+	queries := len(prom.sent())
+	counts := writes.quiet(t, 2*time.Second)
+	if n := len(prom.sent()); n != queries || n != 3 {
+		t.Errorf("%d queries, %d after two quiet seconds; want 3 and no more", queries, n)
+	}
+	t.Logf("a rolled-back rollout (first apply, one step, 3 failed checks, rollback, drain): %d creates, %d Deployment updates, %d status patches, %d queries",
+		counts[0], counts[1], counts[2], queries)
+	if counts[0] != 2 || counts[1] > 6 || counts[2] > 20 {
+		t.Errorf("(creates, updates, status patches) = %v; want 2, at most 6, at most 20", counts)
+	}
+}
