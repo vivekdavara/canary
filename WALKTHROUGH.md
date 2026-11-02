@@ -334,6 +334,15 @@ answer, a rollout is reconciled, `controller_runtime_reconcile_total{controller=
 appears on `/metrics`, and a cancel stops it cleanly. The controller tests can't see a missing scheme registration
 or a controller never set up in `main`; this one can.
 
+**How do you test the analysis without a Prometheus?**
+Three layers. `Evaluate` and `Run` are unit-tested with fake queriers (every verdict, parallel queries, timeouts).
+The HTTP client is tested against `httptest` servers serving responses in the API's documented format: a scalar, a
+vector, an empty one, a matrix, NaN and ±Inf, and each kind of error (`prometheus_test.go`). The envtest tests run the
+operator with the real client against a fake API server that answers every query with one value
+(`newFakePrometheus` in `internal/controller/analysis_test.go`), so the whole path, from the reconcile to the HTTP
+request and back to the status, runs. No real Prometheus runs here (none is installed); the responses follow its
+documented format, which a real server in CI would confirm.
+
 ## The review (day 1)
 
 **What did the review find?**

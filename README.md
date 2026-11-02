@@ -253,6 +253,23 @@ holds); documented under limitations with the 0s case, which has the same fix, a
   test took less than one, so a reset start time looked the same. I committed it chained after the mutant run
   anyway (`cdd6226`, whose message says the mutant fails); `b4ed977` gives each operator a fixed clock and says so.
 
+## What went wrong on day 3
+
+Found by my own tests and reading, before the review:
+
+- **A 1s interval checked every 2s.** I rounded each check's time up to the second, as day 2 rounds pause starts;
+  each next check then came up to a second late. The envtest test counted 2 queries in a 3 s pause instead of 3.
+  Check times are rounded down now (a pause start still rounds up: there the error points the other way).
+- **The hold after a rollback overwrote why it rolled back.** The `Progressing` message was rewritten on the next
+  reconcile with a generic one; the envtest deadline test caught it. The hold keeps the rollback's message now.
+- **A capacity drop**, found by the analysis random walk's first run: a step held past its 0s pause for its first
+  check, after a `replicas` decrease left the canary above the step's count, scaled the canary down while a stable pod
+  was down (10 ready to 9). The hold keeps an oversized canary until the stable is settled, as `waitForCanary` does.
+- **A lowered `failureLimit` was ignored** until the next failed check, so a step could pass with more failures than
+  the spec allowed. The limit is compared at every decision in a pause now.
+- **A shutdown mid-check counted as a failed check**: every query fails with the cancelled context, and with no
+  failure allowed that is a rollback. A check cut short that way is no verdict now.
+
 ## CI
 
 `.github/workflows/ci.yml`: `make check` on Ubuntu, then a check that the generated files were committed, then the
@@ -269,20 +286,34 @@ build.
 - Capacity first: scale up before down, keep the old pods until the new ones are ready, `maxUnavailable: 0`.
 - Deployments are written before the status, Events after it.
 - Thresholds are `float64`, as Prometheus answers; the operator's Prometheus address is its flag, not the rollout's.
+- The analysis fails closed: a check that can't measure (no samples, NaN, an error, a timeout, no Prometheus) fails.
+- `Decide` stays pure with I/O in the loop: a decision says a check is due, the reconciler runs it and decides again
+  from the same input with the result.
+- A rollback keeps capacity like a promotion (the canary drains only once the stable is back), then holds until the
+  template changes; there is no rollback once promotion has started (the old template is gone by then).
 
 ## Limitations
 
-- Day 2: no analysis, no rollback and no progress deadline yet (day 3); steps advance on their pauses alone.
+- No run on a real cluster yet (day 4: kind in CI), and no real Prometheus here: the client is tested against
+  responses in the API's documented format.
+- A check fails closed, so a Prometheus outage rolls rollouts in progress back once `failureLimit` is used up.
+- Reconciles run one at a time and a check runs inside one: a slow Prometheus delays other rollouts by up to
+  `--analysis-timeout` per check.
+- The progress deadline runs per step from when the step began waiting; editing `replicas` during the wait doesn't
+  restart it.
+- `AnalysisPassing` shows the last check run, which after a new rollout starts may be the previous rollout's until the
+  first check (its message names the step and check number).
+- After a rollback, a deleted stable isn't recreated until the template changes (it would run the failed version).
 - Editing the steps or `replicas` mid-pause restarts the step's pause (its pods change).
 - A status write lost at a step advance can make the step run again in two cases: the step's pause was 0s (the one
   decision that passed it is the lost one), or `replicas` went up before the next reconcile (the canary then has
   fewer pods than the step now needs, which looks like an edit). Capacity holds; it costs a pod, or a second pause.
-  Recording the step on the canary Deployment, written with its replicas, would fix both (day 3).
+  Recording the step on the canary Deployment, written with its replicas, would fix both (not done).
 - A restart from a later step, or a new rollout right after a revert, keeps the old canary's pods (old version) until
   the stable is back at its count: capacity over speed.
 - A hand edit to a Deployment's pod template isn't undone (templates are compared by their revision label).
 - If the stable Deployment is deleted, the version it ran is gone: the operator recreates it from the template.
 - One GET per reconcile for the rollout itself (the price of decoding rollouts one at a time).
 - Replica ratio is a coarse split (connections, not requests; one pod of three is 33%).
-- `replicas` is at least 1; no HPA integration, no manual pause or approval.
+- `replicas` is at least 1; no HPA integration, no manual pause, approval or abort.
 - A `k8s.io/api` upgrade that changes the template's encoding would change every revision; a pinned test catches it.
