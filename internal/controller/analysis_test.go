@@ -15,8 +15,11 @@ import (
 	eventsv1 "k8s.io/api/events/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	rolloutsv1alpha1 "github.com/vivekdavara/canary/api/v1alpha1"
 	"github.com/vivekdavara/canary/internal/analysis"
@@ -387,4 +390,46 @@ func TestALongCheckReportIsCut(t *testing.T) {
 		}
 	}
 	t.Fatalf("no AnalysisFailed Event: %d Events", len(list.Items))
+}
+
+// A lastCheckAt stored in another date-time form than a MicroTime's (to the second, as before it was one; another
+// number of digits; another zone) is rewritten to the same instant in microseconds, and the next reconcile decodes
+// the rollout and carries on.
+func TestAStoredCheckTimeInAnotherFormIsRepaired(t *testing.T) {
+	env := testenv.Get(t)
+	for stored, want := range map[string]string{
+		"2026-11-02T10:00:02Z":                "2026-11-02T10:00:02.000000Z",
+		"2026-11-02T10:00:02.5Z":              "2026-11-02T10:00:02.500000Z",
+		"2026-11-02T05:00:02.123456789-05:00": "2026-11-02T10:00:02.123456Z",
+	} {
+		r := direct(t, interceptor.Funcs{})
+		now := time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)
+		r.Now = func() time.Time { return now }
+		ns := env.Namespace(t)
+		ro := analysedRollout(ns, time.Hour, 5)
+		if err := env.Client.Create(context.Background(), ro); err != nil {
+			t.Fatal(err)
+		}
+		key := client.ObjectKeyFromObject(ro)
+		u := &unstructured.Unstructured{}
+		u.SetGroupVersionKind(rolloutsv1alpha1.GroupVersion.WithKind("CanaryRollout"))
+		u.SetNamespace(ns)
+		u.SetName(ro.Name)
+		patch := fmt.Sprintf(`{"status":{"analysis":{"checks":1,"lastCheckAt":%q}}}`, stored)
+		if err := env.Client.Status().Patch(context.Background(), u, client.RawPatch(types.MergePatchType, []byte(patch))); err != nil {
+			t.Fatalf("%s: %v", stored, err)
+		}
+		reconcileOnce(t, r, ro) // repairs
+		if err := env.Client.Get(context.Background(), key, u); err != nil {
+			t.Fatal(err)
+		}
+		if got, _, _ := unstructured.NestedString(u.Object, "status", "analysis", "lastCheckAt"); got != want {
+			t.Fatalf("stored %s: lastCheckAt %q after the repair; want %q", stored, got, want)
+		}
+		reconcileOnce(t, r, ro) // decodes, and creates the stable
+		var got rolloutsv1alpha1.CanaryRollout
+		if err := env.Client.Get(context.Background(), key, &got); err != nil || got.Status.StableRevision == "" {
+			t.Fatalf("stored %s: status %+v, %v; want the rollout carried on", stored, got.Status, err)
+		}
+	}
 }

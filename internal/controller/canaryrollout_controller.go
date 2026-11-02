@@ -118,6 +118,10 @@ func (r *CanaryRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// recreating them would fight the deletion.
 		return ctrl.Result{}, nil
 	}
+	if repaired, err := r.repairCheckTime(ctx, u); repaired || err != nil {
+		// The repaired status is an event of its own, and brings the next reconcile.
+		return ctrl.Result{}, err
+	}
 	var ro rolloutsv1alpha1.CanaryRollout
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &ro); err != nil {
 		return ctrl.Result{}, r.reportUndecodable(ctx, u, err)
@@ -347,6 +351,40 @@ func truncate(s string) string {
 		i--
 	}
 	return s[:i]
+}
+
+// repairCheckTime rewrites status.analysis.lastCheckAt to the microsecond form a MicroTime decodes, if it is stored in
+// another one, and says whether it did. The CRD's schema (format: date-time) accepts any RFC 3339 time, and the operator
+// before lastCheckAt became a MicroTime wrote it to the second ("2026-11-02T10:00:02Z"), which MicroTime refuses to
+// decode, so a rollout mid-pause would have been undecodable after an upgrade: reported InvalidSpec for good, since the
+// typed client can't decode the API server's answer to a status write either. A time that doesn't parse at all is
+// removed (the next check is then due an interval after the pause's start).
+func (r *CanaryRolloutReconciler) repairCheckTime(ctx context.Context, u *unstructured.Unstructured) (bool, error) {
+	s, found, err := unstructured.NestedString(u.Object, "status", "analysis", "lastCheckAt")
+	if !found || err != nil {
+		return false, nil
+	}
+	if _, err := time.Parse(metav1.RFC3339Micro, s); err == nil {
+		return false, nil
+	}
+	var fixed any // nil removes it
+	for _, layout := range []string{time.RFC3339Nano, "2006-01-02T15:04:05.999999999Z0700"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			fixed = t.UTC().Truncate(time.Microsecond).Format(metav1.RFC3339Micro)
+			break
+		}
+	}
+	data, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{"resourceVersion": u.GetResourceVersion()},
+		"status":   map[string]any{"analysis": map[string]any{"lastCheckAt": fixed}},
+	})
+	if err != nil {
+		return false, err
+	}
+	if err := r.Status().Patch(ctx, u, client.RawPatch(types.MergePatchType, data)); err != nil && !apierrors.IsConflict(err) {
+		return false, err
+	}
+	return true, nil
 }
 
 // reportUndecodable records on the rollout's own status that it can't be decoded, without decoding the rest of it:

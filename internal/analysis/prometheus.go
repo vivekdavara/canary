@@ -48,6 +48,8 @@ type apiResponse struct {
 	ErrorType string   `json:"errorType"`
 	Error     string   `json:"error"`
 	Warnings  []string `json:"warnings"`
+	// IsPartial is how VictoriaMetrics' cluster version marks an answer missing some storage nodes' data.
+	IsPartial bool `json:"isPartial"`
 	Data      struct {
 		ResultType string          `json:"resultType"`
 		Result     json.RawMessage `json:"result"`
@@ -88,6 +90,9 @@ func (p *Prometheus) Query(ctx context.Context, query string) (Result, error) {
 	// Cortex and Mimir answer "success" with the series they could get). A partial answer can leave out exactly the
 	// failing series, so it fails. PromQL's info annotations ("PromQL info: ...", in warnings before Prometheus 3)
 	// say nothing about the data and are ignored.
+	if r.IsPartial {
+		return Result{}, errors.New("Prometheus marked the answer partial (isPartial)")
+	}
 	for _, w := range r.Warnings {
 		if !strings.HasPrefix(w, "PromQL info:") {
 			return Result{}, fmt.Errorf("Prometheus answered with a warning, so the answer may be partial: %s", w)
