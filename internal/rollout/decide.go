@@ -366,6 +366,9 @@ func decide(in Input) Plan {
 			canaryWant = canary.Replicas
 		}
 		msg := fmt.Sprintf("%s: pods ready, paused until %s", stepName(in.Spec, i), end.UTC().Format(time.RFC3339))
+		if !in.Now.Before(end) {
+			msg = fmt.Sprintf("%s: pods ready, pause over, waiting for a check", stepName(in.Spec, i))
+		}
 		wake := end
 		if a := in.Spec.Analysis; a != nil {
 			msg += fmt.Sprintf("; checks: %d, %d failed, the next at %s", st.Analysis.Checks, st.Analysis.FailedChecks, nextCheck.UTC().Format(time.RFC3339))

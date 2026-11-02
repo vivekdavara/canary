@@ -174,7 +174,8 @@ func TestAPauseShorterThanTheIntervalWaitsForACheck(t *testing.T) {
 	w.settle()
 	ready := w.now
 	p := w.run()
-	if p.Reason != ReasonStepPaused || p.RequeueAfter != 45*time.Second || *w.state.CurrentStep != 0 {
+	if p.Reason != ReasonStepPaused || p.RequeueAfter != 45*time.Second || *w.state.CurrentStep != 0 ||
+		!strings.Contains(p.Message, "pause over, waiting for a check; checks: 0, 0 failed, the next at 2026-11-01T10:00:45Z") {
 		t.Fatalf("plan %+v; want held for the first check in 45s", p)
 	}
 	w.expect(v1.PhaseProgressing, 9, 1)
