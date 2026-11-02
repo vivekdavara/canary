@@ -142,7 +142,7 @@ play its part: they write a Deployment's status (`markReady`) when its pods woul
 | `internal/analysis/prometheus_test.go` (unit) | the client against canned API responses: a scalar, one sample, two, none, a matrix, warnings, NaN and ±Inf; each error (`bad_data`, `timeout`, a proxy's HTML page, an empty envelope, a success with a 500, a histogram sample, a bad value, a value that isn't a string, a short sample, an answer over 1 MiB); a hung server and a closed one; the URL's validation |
 | `internal/rollout/rollback_test.go` (unit) | the deadline (rolls back on its exact second; per step), a rollback with the stable down (the canary kept until the stable is back), checks every interval (four in a 2m pause at 30s), a pause shorter than the interval, the failure limit (failures tolerated, then the rollback, each a Warning), checks starting over with the pause, a deleted stable after a rollback (not recreated from the failed template), template changes after a rollback, a lost rollback write, a due check holding the step, a 1s interval with late reconciles, the hold keeping the rollback's message, a lowered limit, the walk's capacity case |
 | `internal/rollout/walk_analysis_test.go` (unit) | 4,000 random walks with checks passing or failing at random, the deadline, slow and lost pods, lost status writes, new templates, `replicas` and `failureLimit` edits; after every decision: capacity, a rollback never touching the stable's template, a held rollout never growing the canary or promoting the rolled-back revision, a step passing only after a check and within the limit, the status consistent; every walk ends `Healthy` or held after its rollback; a census makes sure each case happens at least 300 times |
-| `internal/rollout/review_d3_*_test.go`, `internal/analysis/review_d3_prometheus_test.go` (unit); `review_d3b_*_test.go` (the second round's, one of them envtest) | the day 3 reviews' findings, as they wrote them, and the first round's walk (`TestReviewD3Walks`, 6,000 walks with deletions, edits of every analysis field, analysis removed and added, and status times stored to the second) |
+| `internal/rollout/review_d3_*_test.go`, `internal/analysis/review_d3_prometheus_test.go` (unit); `review_d3b_*_test.go` and `review_d3c_*_test.go` (the second and third rounds', some envtest) | the day 3 reviews' findings, as they wrote them, and the first round's walk (`TestReviewD3Walks`, 6,000 walks with deletions, edits of every analysis field, analysis removed and added, and status times stored to the second) |
 | `internal/controller/analysis_test.go` | through the real HTTP client and a fake Prometheus API: a passing analysis promotes (3 checks in a 3 s pause at 1 s), a failing one rolls back (Warning Events, both conditions, the stable back, the canary drained, no more queries), the progress deadline rolls back on its requeue, no Prometheus fails closed, a hung Prometheus fails at the timeout; a rolled-back rollout's writes counted, and none in the hold |
 | `internal/controller/undecodable_test.go` | a rollout with a probe port beyond int32 (accepted, undecodable) gets `InvalidSpec` on its own status while another rollout keeps being reconciled |
 | `internal/controller/rollout_test.go` (`TestARolloutsWrites`) | a whole rollout's writes counted at the operator's own client, and none in the two seconds after it ends: a guard against a reconcile that writes in a loop (a status carrying the time wrote 984 patches in those two seconds) |
@@ -162,6 +162,29 @@ optimistic lock fails `TestAStatusFromAnOlderSpecIsNotWritten`; dropping either 
 Deployments fails `TestSomeoneElsesDeploymentWithTheName`. From day 1: removing the Deployments rule
 from `config/rbac/role.yaml` fails `TestStatusFollowsTheSpec`; removing the Lease rule fails `TestRunElectsALeader`;
 misspelling `failureLimit` in the sample fails `TestSamplesAreAccepted`.
+
+## Results (day 3)
+
+Still no cluster (day 4 runs kind in CI) and no real Prometheus here; the analysis runs against a fake Prometheus API
+in envtest. Measured on an Apple M3, on AC, with nothing else running, at `b6b6df8`:
+
+- `make check`: 53.79 s real (`/usr/bin/time -p make check`): 125 top-level tests (`go test -list '.*' ./... | grep -c
+  ^Test`; 70 at day 2's end), all seven packages `ok`, none skipped. The controller package alone takes about 50 s:
+  the analysis tests run real 1 s check intervals and a 2 s deadline.
+- **What a rolled-back rollout costs**: 2 creates, 3 Deployment updates, 11 status patches and 3 Prometheus queries
+  (first apply, one 50% step, three failed checks a second apart with two allowed, the rollback, the drain), the same
+  in three runs at `036aff0` and again at `b6b6df8`; then two quiet seconds with no write and no query
+  (`go test -run 'TestARolloutsWrites|TestARolledBackRolloutsWrites' -v ./internal/controller/` with
+  `KUBEBUILDER_ASSETS` set). Day 2's rollout with no analysis still costs 2 creates, 3 updates and 9 patches.
+- `TestRandomWalksWithAnalysis`: 4,000 walks, 0.32 s; census at `b6b6df8` (`-v`): 1,353 rollbacks by the analysis,
+  4,114 by the deadline, 41 by a lowered failure limit, 2,817 failed checks tolerated, 17,663 steps passed after
+  checks, 7,491 promotions, 49,950 lost status writes (2,307 of them in a decision that ran a check), 70,049 decisions
+  during a hold; 3,307 walks ended `Healthy` and 693 held after a rollback.
+- `TestReviewD3Walks` (the review's): 6,000 walks, 0.50 s; 120,063 lost status writes, 4,543 stable and 4,460 canary
+  deletions, 7,209 rollbacks, 6,151 templates set back to a rolled-back revision, 95 walks ending held with the
+  stable deleted.
+- Day 2's walks with no deadline: `TestRandomWalks` 0.13 s, `TestRandomWalksWithEdits` 0.21 s.
+- The CRD is 638,009 bytes (`wc -c config/crd/bases/*`; 636,521 on day 2: the new status fields).
 
 ## Results (day 2)
 
@@ -281,6 +304,14 @@ the deadline but not a rollback by a failed check whose write was lost, which le
 `237ba4f`: with the stable gone mid-pause, a due check runs first and decides). Also an answer marked `isPartial`
 (VictoriaMetrics) without warnings passed (fixed), and a day 1 test raced the operator's status writes (fixed,
 `d3b4ae2`). Five mutants of my round-1 branch survived; each fails a test now.
+
+A third agent, on round 2's two fixes (`237ba4f`, 21 minutes, `review_d3c_*`), found four defects in them, all fixed
+in `b6b6df8`: a check run with the stable gone that passed or failed within the limit was dropped when day 2's rule
+recreated the stable (no `AnalysisFailed`, no `AnalysisPassing`); a rollback by such a check counted the failure but
+not the check; the repair converted times to UTC, so `9999-12-31T23:00:00-05:00` became the year 10000, which the API
+server refuses, and every reconcile failed; and a lower-case `t` or `z` (RFC 3339 allows them) dropped the instant.
+Its survivors (the repair's optimistic lock and conflict path, the plan asking for a check with the stable gone) each
+have a test now. Round 3's fixes have not been reviewed.
 
 The first agent also listed five mechanisms it could break with every test passing: the wait's start rounded up, `AnalysisFailed`'s
 action, the Event note and the `AnalysisPassing` message cut to 1 KiB, and the canary kept in a hold with the stable

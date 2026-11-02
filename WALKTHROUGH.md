@@ -465,6 +465,13 @@ upgrade, stuck as `InvalidSpec`. The reconciler now rewrites that field to micro
 whose write was lost shows only as a check due again, so with the stable gone a due check now runs first. Lesson: a
 change of a stored field's type is a migration, even on an unreleased field, if anything already wrote it.
 
+**And the third?**
+It reviewed round 2's two fixes and found four defects in them: a check run with the stable gone was dropped unless it
+rolled back; it wasn't counted when it did; the repair converted times to UTC, which can push one past the year 9999
+(the API server then refuses the rewrite, and every reconcile failed); and it dropped times written with a lower-case
+`t` or `z`. Each round so far found something in the round before it, which is why each fix gets its own test and its
+own mutant run, and why the README says round 3's fixes are unreviewed.
+
 **Why didn't your own walk find the deleted-stable case?**
 It never deleted a Deployment: I wrote it for analysis and the deadline, and left deletions to day 2's walk, which has
 no analysis. The review's walk combines them, and it's in the repository now (`review_d3_walk_test.go`).
