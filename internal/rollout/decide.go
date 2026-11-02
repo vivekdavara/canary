@@ -198,6 +198,7 @@ func decide(in Input) Plan {
 	// due again. So a due check runs first (the two calls of the normal path), and decides (the review's second round).
 	if stable == nil {
 		failedChecks := last.Analysis.FailedChecks
+		analysisAfter := last.Analysis // with the check this decision ran, if any
 		var checked *CheckResult
 		var events []Event
 		if a := in.Spec.Analysis; a != nil && last.Phase == v1.PhaseProgressing && last.CanaryRevision == rev &&
@@ -217,6 +218,8 @@ func decide(in Input) Plan {
 						AnalysisDue: true,
 					}
 				}
+				analysisAfter.Checks++
+				analysisAfter.LastCheckAt = &metav1.MicroTime{Time: in.Now.Truncate(time.Microsecond)}
 				msg := fmt.Sprintf("%s, check %d", stepName(in.Spec, i), last.Analysis.Checks+1)
 				if in.Check.Passed() {
 					checked = &CheckResult{Passed: true, Message: msg + " passed: " + in.Check.String()}
@@ -232,6 +235,7 @@ func decide(in Input) Plan {
 			st := last
 			st.Phase, st.RolledBackRevision, st.CanaryRevision = v1.PhaseRolledBack, rev, ""
 			st.StepStartedAt, st.StepWaitingSince = nil, nil
+			st.Analysis = analysisAfter
 			st.Analysis.FailedChecks = failedChecks
 			return Plan{
 				Canary:  Target{Replicas: replicasOf(canary)},
@@ -243,14 +247,15 @@ func decide(in Input) Plan {
 				Checked: checked,
 			}
 		}
-	}
-	if stable == nil {
+		// Day 2's rule, with the check this decision ran (if any) reported: its Event and AnalysisPassing.
 		return Plan{
 			Stable:  Target{Replicas: r, FromTemplate: true},
 			Canary:  Target{Replicas: replicasOf(canary)},
 			State:   State{Phase: v1.PhaseHealthy, StableRevision: rev},
 			Reason:  ReasonIdle,
 			Message: fmt.Sprintf("creating the stable Deployment at revision %s", rev),
+			Events:  events,
+			Checked: checked,
 		}
 	}
 

@@ -368,23 +368,36 @@ func (r *CanaryRolloutReconciler) repairCheckTime(ctx context.Context, u *unstru
 		return false, nil
 	}
 	var fixed any // nil removes it
+	// RFC 3339 allows a lower-case "t" and "z"; Go parses upper case only. The time keeps its own offset: converted to
+	// UTC, 9999-12-31T23:00:00-05:00 would be in the year 10000, which the schema refuses.
 	for _, layout := range []string{time.RFC3339Nano, "2006-01-02T15:04:05.999999999Z0700"} {
-		if t, err := time.Parse(layout, s); err == nil {
-			fixed = t.UTC().Truncate(time.Microsecond).Format(metav1.RFC3339Micro)
+		if t, err := time.Parse(layout, strings.ToUpper(s)); err == nil {
+			fixed = t.Truncate(time.Microsecond).Format(metav1.RFC3339Micro)
 			break
 		}
 	}
-	data, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{"resourceVersion": u.GetResourceVersion()},
-		"status":   map[string]any{"analysis": map[string]any{"lastCheckAt": fixed}},
-	})
-	if err != nil {
-		return false, err
+	err = r.patchCheckTime(ctx, u, fixed)
+	if apierrors.IsInvalid(err) && fixed != nil {
+		// The API server refused the rewritten time: remove it rather than fail every reconcile.
+		err = r.patchCheckTime(ctx, u, nil)
 	}
-	if err := r.Status().Patch(ctx, u, client.RawPatch(types.MergePatchType, data)); err != nil && !apierrors.IsConflict(err) {
+	if err != nil && !apierrors.IsConflict(err) {
 		return false, err
 	}
 	return true, nil
+}
+
+// patchCheckTime sets status.analysis.lastCheckAt to t (nil removes it) with a JSON merge patch carrying the
+// resourceVersion read, so it fails with a conflict if the rollout changed since.
+func (r *CanaryRolloutReconciler) patchCheckTime(ctx context.Context, u *unstructured.Unstructured, t any) error {
+	data, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{"resourceVersion": u.GetResourceVersion()},
+		"status":   map[string]any{"analysis": map[string]any{"lastCheckAt": t}},
+	})
+	if err != nil {
+		return err
+	}
+	return r.Status().Patch(ctx, u.DeepCopy(), client.RawPatch(types.MergePatchType, data))
 }
 
 // reportUndecodable records on the rollout's own status that it can't be decoded, without decoding the rest of it:

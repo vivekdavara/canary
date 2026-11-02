@@ -1,6 +1,7 @@
 package rollout
 
 import (
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -527,5 +528,25 @@ func TestADeletedStableWithNoFailureIsRecreated(t *testing.T) {
 	expectRecreated(w, "r2")
 	if w.checked != 1 {
 		t.Fatalf("%d checks; want the due one run first", w.checked)
+	}
+}
+
+// With the stable gone and a check due, the first decision asks for the check and is safe to carry out as it is: the
+// canary keeps its pods, nothing is created, the status is unchanged. A passing check then recreates the stable from
+// the template (day 2's rule) and is reported (AnalysisPassing).
+func TestTheDueCheckWithTheStableGone(t *testing.T) {
+	w := newWorld(t, 4, step(25, time.Hour)).withAnalysis(time.Minute, 0).started()
+	w.settle()
+	w.run()
+	w.now = w.now.Add(time.Minute)
+	w.stable = nil
+	p := Decide(Input{Spec: &w.spec, Revision: w.rev, Status: w.state, Canary: w.canary, Now: w.now})
+	if !p.AnalysisDue || p.Stable.FromTemplate || p.Canary.Replicas != w.canary.Replicas || p.Reason != ReasonStepPaused ||
+		!reflect.DeepEqual(p.State, w.state) {
+		t.Fatalf("plan %+v; want the check asked for, the canary kept, nothing created, the status as it was", p)
+	}
+	p = w.run()
+	if w.stable == nil || w.stable.Revision != "r2" || p.Checked == nil || !p.Checked.Passed || w.checked != 1 {
+		t.Fatalf("stable %+v, checked %+v; want the stable recreated and the passing check reported", w.stable, p.Checked)
 	}
 }

@@ -400,7 +400,7 @@ func TestAStoredCheckTimeInAnotherFormIsRepaired(t *testing.T) {
 	for stored, want := range map[string]string{
 		"2026-11-02T10:00:02Z":                "2026-11-02T10:00:02.000000Z",
 		"2026-11-02T10:00:02.5Z":              "2026-11-02T10:00:02.500000Z",
-		"2026-11-02T05:00:02.123456789-05:00": "2026-11-02T10:00:02.123456Z",
+		"2026-11-02T05:00:02.123456789-05:00": "2026-11-02T05:00:02.123456-05:00",
 	} {
 		r := direct(t, interceptor.Funcs{})
 		now := time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)
@@ -431,5 +431,58 @@ func TestAStoredCheckTimeInAnotherFormIsRepaired(t *testing.T) {
 		if err := env.Client.Get(context.Background(), key, &got); err != nil || got.Status.StableRevision == "" {
 			t.Fatalf("stored %s: status %+v, %v; want the rollout carried on", stored, got.Status, err)
 		}
+	}
+}
+
+// The repair's patch carries the resourceVersion read: if the rollout changed since (here the test changes a label
+// between the read and the patch), the patch is refused with a conflict, the reconcile ends without error, and the
+// next one repairs.
+func TestARepairThatConflictsIsRetried(t *testing.T) {
+	env := testenv.Get(t)
+	ns := env.Namespace(t)
+	ro := analysedRollout(ns, time.Hour, 5)
+	if err := env.Client.Create(context.Background(), ro); err != nil {
+		t.Fatal(err)
+	}
+	key := client.ObjectKeyFromObject(ro)
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(rolloutsv1alpha1.GroupVersion.WithKind("CanaryRollout"))
+	u.SetNamespace(ns)
+	u.SetName(ro.Name)
+	if err := env.Client.Status().Patch(context.Background(), u, client.RawPatch(types.MergePatchType,
+		[]byte(`{"status":{"analysis":{"checks":1,"lastCheckAt":"2026-11-02T10:00:02Z"}}}`))); err != nil {
+		t.Fatal(err)
+	}
+	interfere := true
+	r := direct(t, interceptor.Funcs{
+		SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			if interfere {
+				interfere = false
+				other := &unstructured.Unstructured{}
+				other.SetGroupVersionKind(rolloutsv1alpha1.GroupVersion.WithKind("CanaryRollout"))
+				other.SetNamespace(ns)
+				other.SetName(key.Name)
+				if err := env.Client.Patch(ctx, other, client.RawPatch(types.MergePatchType, []byte(`{"metadata":{"labels":{"touched":"yes"}}}`))); err != nil {
+					t.Error(err)
+				}
+			}
+			return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
+		},
+	})
+	stored := func() string {
+		t.Helper()
+		if err := env.Client.Get(context.Background(), key, u); err != nil {
+			t.Fatal(err)
+		}
+		s, _, _ := unstructured.NestedString(u.Object, "status", "analysis", "lastCheckAt")
+		return s
+	}
+	reconcileOnce(t, r, ro) // the patch conflicts: no error, nothing repaired
+	if s := stored(); s != "2026-11-02T10:00:02Z" {
+		t.Fatalf("lastCheckAt %q after a conflicting repair; want it unchanged", s)
+	}
+	reconcileOnce(t, r, ro)
+	if s := stored(); s != "2026-11-02T10:00:02.000000Z" {
+		t.Fatalf("lastCheckAt %q; want it repaired by the next reconcile", s)
 	}
 }
