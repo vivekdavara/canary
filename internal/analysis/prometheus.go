@@ -31,7 +31,9 @@ func NewPrometheus(base string, client *http.Client) (*Prometheus, error) {
 		return nil, fmt.Errorf("the Prometheus URL %q: want http:// or https://", base)
 	case u.Host == "":
 		return nil, fmt.Errorf("the Prometheus URL %q has no host", base)
-	case u.RawQuery != "" || u.Fragment != "" || u.User != nil:
+	case strings.ContainsAny(base, "?#") || u.User != nil:
+		// Checked on the text: a bare "?" or "#" leaves the parsed query and fragment empty, and would end up in the
+		// endpoint ("http://p:9090?/api/v1/query" asks Prometheus's UI, not its API).
 		return nil, fmt.Errorf("the Prometheus URL %q: want no query, fragment or user", base)
 	}
 	return &Prometheus{endpoint: strings.TrimSuffix(u.String(), "/") + "/api/v1/query", client: client}, nil
@@ -42,9 +44,10 @@ const maxResponse = 1 << 20
 
 // The API's envelope (https://prometheus.io/docs/prometheus/latest/querying/api/#format-overview).
 type apiResponse struct {
-	Status    string `json:"status"`
-	ErrorType string `json:"errorType"`
-	Error     string `json:"error"`
+	Status    string   `json:"status"`
+	ErrorType string   `json:"errorType"`
+	Error     string   `json:"error"`
+	Warnings  []string `json:"warnings"`
 	Data      struct {
 		ResultType string          `json:"resultType"`
 		Result     json.RawMessage `json:"result"`
@@ -80,6 +83,15 @@ func (p *Prometheus) Query(ctx context.Context, query string) (Result, error) {
 	}
 	if resp.StatusCode != http.StatusOK {
 		return Result{}, fmt.Errorf("HTTP %d from Prometheus", resp.StatusCode)
+	}
+	// A warning means the answer may be partial: a store or remote-read endpoint was down, a limit was hit (Thanos,
+	// Cortex and Mimir answer "success" with the series they could get). A partial answer can leave out exactly the
+	// failing series, so it fails. PromQL's info annotations ("PromQL info: ...", in warnings before Prometheus 3)
+	// say nothing about the data and are ignored.
+	for _, w := range r.Warnings {
+		if !strings.HasPrefix(w, "PromQL info:") {
+			return Result{}, fmt.Errorf("Prometheus answered with a warning, so the answer may be partial: %s", w)
+		}
 	}
 	res := Result{Type: r.Data.ResultType}
 	switch res.Type {

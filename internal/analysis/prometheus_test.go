@@ -113,6 +113,10 @@ func TestPrometheusErrors(t *testing.T) {
 			"a sample value that isn't a string"},
 		{"short sample", http.StatusOK, `{"status":"success","data":{"resultType":"scalar","result":[1]}}`,
 			"a sample that isn't [time, value]"},
+		{"a partial answer", http.StatusOK, `{"status":"success","warnings":["PromQL info: x","store 10.0.0.7:10901 unavailable"],"data":{"resultType":"vector","result":[{"metric":{},"value":[1,"0"]}]}}`,
+			"Prometheus answered with a warning, so the answer may be partial: store 10.0.0.7:10901 unavailable"},
+		{"a PromQL warning", http.StatusOK, `{"status":"success","warnings":["PromQL warning: encountered a mix of histograms and floats"],"data":{"resultType":"vector","result":[]}}`,
+			"PromQL warning: encountered a mix"},
 		{"too large", http.StatusOK, `{"status":"success","data":{"resultType":"vector","result":[` + strings.Repeat(`{"metric":{},"value":[1,"1"]},`, 40000) + `]}}`,
 			"over 1048576 bytes"},
 	} {
@@ -166,6 +170,9 @@ func TestNewPrometheus(t *testing.T) {
 		"http://someone@example.com":            "want no query, fragment or user",
 		"http://example.com/#frag":              "want no query",
 		"http://example.com:9090/path with sp%": "invalid URL escape",
+		"http://example.com:9090?":              "want no query",
+		"http://example.com:9090/?":             "want no query",
+		"http://example.com:9090#":              "want no query",
 	} {
 		p, err := NewPrometheus(base, http.DefaultClient)
 		got := ""
