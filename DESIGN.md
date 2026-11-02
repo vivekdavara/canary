@@ -140,7 +140,7 @@ Why these choices:
 | `currentStep` | the index of the step in progress (the last one during `Promoting`; after a rollback, the step that failed) |
 | `stepStartedAt` | when the current step's pods became ready and its pause began; cleared when the step ends |
 | `stepWaitingSince` | when the current step began waiting for its canary pods; the progress deadline runs from it; cleared when its pause begins |
-| `analysis` | the current step's checks: `checks`, `failedChecks`, `lastCheckAt`; they start over with the step's pause (after a rollback, those of the step that failed) |
+| `analysis` | the current step's checks: `checks`, `failedChecks`, `lastCheckAt` (to the microsecond); they start over with the step's pause (after a rollback, those of the step that failed) |
 | `stableReplicas`, `canaryReplicas` | ready pods of each, as last read |
 | `canaryWeight` | the canary's actual share of the ready pods, in percent, rounded down |
 | `conditions` | `Progressing`, `Available`, `AnalysisPassing` ("Conditions" below) |
@@ -331,8 +331,10 @@ long one fits, evaluated at Prometheus's own time). The answer must be one numbe
 one sample. The metric passes when that number is within `[min, max]`, both inclusive. It fails in every other case:
 below `min` or above `max`, NaN or infinite, an empty vector, more than one sample, a matrix or a string, a
 native-histogram sample, an API error (`bad_data`, `timeout`, ...), an answer that isn't the API's (a proxy's HTML
-error page), a success with an HTTP error code, an answer over 1 MiB, a refused connection, or no answer within the
-operator's `--analysis-timeout` (10s by default). An analysis that can't measure doesn't pass: it fails closed.
+error page), a success with an HTTP error code, a success with warnings (the answer may be partial: Thanos, Cortex and
+Mimir answer "success" with the series they could get when a store is down, which can leave out exactly the failing
+series; PromQL's `PromQL info:` annotations are ignored), an answer over 1 MiB, a refused connection, or no answer
+within the operator's `--analysis-timeout` (10s by default). An analysis that can't measure doesn't pass: it fails closed.
 Without `--prometheus-url` every check fails, with a message naming the flag. A **check** runs every metric once (in
 parallel) and passes when all of them pass (`internal/analysis`: `Evaluate` is the verdict, `Run` the check,
 `Prometheus` the client).
@@ -345,13 +347,17 @@ mistake, rolling back a good version during a Prometheus outage, costs a retry, 
 
 Checks belong to a step's pause. The first is due one `interval` after the pause starts (a check at the very start
 would measure pods that have had no traffic yet, and an empty answer fails), and each next one an `interval` after the
-last. A step with analysis passes only when its pause is over **and** it has had at least one check, so a pause
-shorter than the interval (a 0s pause included) lasts until the first check. With a 2m pause and a 30s interval, the
-checks run at 30s, 60s, 90s and 120s, and the step passes on the last.
+last. A step with analysis passes only on a check made at or after its pause's end (and with no more failures than
+the limit), so a pause shorter than the interval (a 0s pause included) lasts until the first check, and every step's
+last check covers its pause's last interval. With a 2m pause and a 30s interval, the checks run at 30s, 60s, 90s and
+120s (each a few milliseconds later than the last, as reconciles come), and the step passes on the last.
 
-Each check's time is kept rounded *down* to the second (the API server stores status times to the second), so the
-next check is due at most an interval after it. Rounded up, every check would be up to a second late, and a 1s
-interval checked only every 2s (an envtest test found that).
+Checks are an interval apart: `lastCheckAt` is a `MicroTime`, stored to the microsecond, and the next check is due
+exactly an interval after it. Both second-granularity versions were wrong. Rounded up (my first), each check came up
+to a second late, and a 1s interval checked every 2s (an envtest test found it); rounded down (my second), a check
+that ran 0.9s late was recorded 0.9s early, so a reconcile 100 ms later ran another, and one bad moment counted twice
+(the review found it). Pause starts and the deadline's start stay `Time`s, rounded up: there a second late is
+harmless and a second early is not.
 
 The checks start over with the pause: an edit that restarts a step's pause (its pods change) also clears its checks
 and failures. `analysis.failureLimit` is read at every decision during a pause: more failed checks than the limit
@@ -365,6 +371,9 @@ included, plus the result (`Input.Check`). The second decision records it: `anal
 `failedChecks` go up, `lastCheckAt` is set, the `AnalysisPassing` condition gets the result, a failed check records a
 Warning `AnalysisFailed` Event, and more failures than the limit roll back in the same decision. The unit tests run
 checks the same way (`world.run` in `internal/rollout/decide_test.go`).
+
+A check cut short because the operator is stopping (the reconcile's context is cancelled, so every query fails) is
+no verdict: the reconcile returns without deciding, and the next leader checks again.
 
 A check whose status write is lost (a conflict) is due again at the next reconcile and runs again: the lost result
 isn't counted, and its Event isn't recorded (Events go out only after the status write).
@@ -399,6 +408,12 @@ Rules, and why:
   from it would run that version at all replicas with no canary and no analysis. The operator creates nothing and
   says so (`Progressing` False, `RolledBack`, "the stable Deployment is gone ... set the template to the version to
   run"); a template change recreates it.
+- **A missing stable after a failure that wasn't recorded.** If the status alone says the rollout failed (its step's
+  deadline past with the step's pods still not ready, or more failed checks than the limit) and the stable is gone,
+  the rollback is recorded and nothing is created. That is a rollback whose status write was lost, or a deadline that
+  passed while the operator wasn't running, followed by the stable's deletion; day 2's rule would have recreated the
+  stable from the failed template at all replicas (the review found it). Pods that became ready late still count: the
+  step then starts, as on the normal path, and a deleted stable is recreated from the template as on day 2.
 - **A rollback whose status write is lost is decided again.** The Deployments are written first, so the stable may
   already be back at `replicas`. The next decision rolls back again if the deadline is still past; after a failed
   check, a new check runs, and if that one passes the rollout carries on and the stable comes back down to the step's
@@ -436,6 +451,11 @@ Rules, and why:
   without `omitempty` would give every unchanged template a new revision, and so start a rollout of everything it
   manages. `TestRevisionIsPinned` pins one template's revision so such an upgrade fails a test instead of shipping;
   the fix then would be to compare templates semantically rather than by hash.
+- **A rolled-back canary keeps all its pods, ready or not, until the stable is back.** In a namespace with a tight
+  ResourceQuota its unready pods (after a deadline rollback) could hold the quota the stable needs to scale up, and
+  the hold would never finish (the review's suspicion, not reproduced: envtest runs no quota controller). Keeping only
+  its ready pods would free the quota, but a Deployment spreads a scale-down over its ReplicaSets, so a canary
+  mid-template-change could lose ready pods.
 - **Reconciles run one at a time**, and a check runs inside one, so a slow Prometheus holds up other rollouts by up to
   `--analysis-timeout` per check (the metrics of one check are queried in parallel).
 - **The progress deadline runs per step from when the step began waiting**, and edits during the wait (more replicas)

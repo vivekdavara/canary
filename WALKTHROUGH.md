@@ -229,12 +229,19 @@ when its pause is over and it has had at least one check, so a 0s pause lasts on
 (`TestAPauseShorterThanTheIntervalWaitsForACheck`); with a 2m pause and 30s interval the checks are at 30, 60, 90 and
 120 s and the step passes on the last (`TestChecksRunEveryIntervalDuringThePause`).
 
-**Why round a check's time down when pause starts are rounded up?**
-Both because the API server stores status times to the second, but the errors point different ways. A pause start
-rounded down would end the pause early, so it's rounded up. A check time rounded up delays the next check, by up to a
-second each time, which compounds: a 1s interval checked every 2s, which the envtest test caught (2 queries in a 3 s
-pause instead of 3). Rounded down, the next check is due at most an interval after the last
-(`TestASecondIntervalChecksEverySecond`).
+**Why is `lastCheckAt` a MicroTime when the other times are seconds?**
+The API server stores a `metav1.Time` to the second, and for check times both roundings were wrong. Rounded up (my
+first try), each next check came up to a second late, which compounds: a 1s interval checked every 2s (the envtest
+test saw 2 queries in a 3 s pause). Rounded down (my second), a check that ran 0.9 s late was recorded 0.9 s early,
+so a reconcile 100 ms later ran another one, counting one bad moment twice (the review's test). A `MicroTime` is
+stored to the microsecond, so the next check is exactly an interval after the last. Pause starts and the deadline's
+start stay seconds, rounded up, because there a second late is harmless and a second early isn't.
+
+**What stops drift from skipping the last check of a pause?**
+A step with analysis passes only on a check made at or after its pause's end. Checks drift a few milliseconds per
+interval (each is an interval after the actual last one), so "pause over and at least one check" let a 3 s pause at
+1 s end at 3.000 s with checks at 1.005 and 2.010, the last interval unmeasured. Now it waits for the check at 3.015 s
+(`TestAStepEndsOnACheckAtOrAfterItsPausesEnd`).
 
 **What happens to the checks when someone edits the rollout mid-step?**
 They belong to the pause. An edit that changes the step's pods (`replicas`, the steps) restarts the pause and clears
@@ -437,6 +444,34 @@ test starts a second API server with the plugin; with the old role no Deployment
 The API server stores status times to the second. Written as 10:00:00.9 and read back as 10:00:00, a 2-minute pause
 ended at 10:02:00, 0.9 s early. Rounding down would do the same; rounding up to 10:00:01 makes it run 2m0.1s, never
 less than asked.
+
+## The review (day 3)
+
+**What did the review find?**
+No capacity defect, and a 6,000-walk stress test of its own that passed. One medium defect: day 3 stops a deleted
+stable from being recreated from a rolled-back template, but only once `RolledBack` is in the status; with the
+rollback's status write lost, or the deadline passing while the operator was down, deleting the stable put the failed
+version at all replicas. Now, if the status alone says the rollout failed (deadline past with pods not ready, or too
+many failures) and the stable is gone, the rollback is recorded and nothing is created (`alreadyFailed` in
+`decide.go`). Three low ones: checks 100 ms apart (fixed with `MicroTime`), a Prometheus URL ending in `?` accepted and
+then failing every query, and a partial answer (`success` with warnings) passing. And five mechanisms no test caught,
+each with a test now.
+
+**Why didn't your own walk find the deleted-stable case?**
+It never deleted a Deployment: I wrote it for analysis and the deadline, and left deletions to day 2's walk, which has
+no analysis. The review's walk combines them, and it's in the repository now (`review_d3_walk_test.go`).
+
+## What went wrong on day 3
+
+- My first check-time rounding (up) made a 1s interval check every 2s; my second (down) let two checks run 100 ms
+  apart. Both came from forcing check times into seconds; a `MicroTime` was the fix.
+- The hold after a rollback overwrote the message saying why (an envtest test caught it).
+- The analysis walk's first run found a capacity drop in a step held for its first check (fixed, with a regression
+  test).
+- I compared the failure limit only after a failed check, so lowering it mid-step didn't count; and a shutdown
+  mid-check counted as a failed check. Both found while reading the code, both fixed with tests.
+- A deleted stable after a lost rollback write (the review's medium finding): my walks never combined deletions with
+  analysis.
 
 ## What went wrong on day 2
 

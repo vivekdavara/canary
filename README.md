@@ -142,6 +142,7 @@ play its part: they write a Deployment's status (`markReady`) when its pods woul
 | `internal/analysis/prometheus_test.go` (unit) | the client against canned API responses: a scalar, one sample, two, none, a matrix, warnings, NaN and ±Inf; each error (`bad_data`, `timeout`, a proxy's HTML page, an empty envelope, a success with a 500, a histogram sample, a bad value, a value that isn't a string, a short sample, an answer over 1 MiB); a hung server and a closed one; the URL's validation |
 | `internal/rollout/rollback_test.go` (unit) | the deadline (rolls back on its exact second; per step), a rollback with the stable down (the canary kept until the stable is back), checks every interval (four in a 2m pause at 30s), a pause shorter than the interval, the failure limit (failures tolerated, then the rollback, each a Warning), checks starting over with the pause, a deleted stable after a rollback (not recreated from the failed template), template changes after a rollback, a lost rollback write, a due check holding the step, a 1s interval with late reconciles, the hold keeping the rollback's message, a lowered limit, the walk's capacity case |
 | `internal/rollout/walk_analysis_test.go` (unit) | 4,000 random walks with checks passing or failing at random, the deadline, slow and lost pods, lost status writes, new templates, `replicas` and `failureLimit` edits; after every decision: capacity, a rollback never touching the stable's template, a held rollout never growing the canary or promoting the rolled-back revision, a step passing only after a check and within the limit, the status consistent; every walk ends `Healthy` or held after its rollback; a census makes sure each case happens at least 300 times |
+| `internal/rollout/review_d3_*_test.go`, `internal/analysis/review_d3_prometheus_test.go` (unit) | the day 3 review's findings, as it wrote them, and its walk (`TestReviewD3Walks`, 6,000 walks with deletions, edits of every analysis field, analysis removed and added, and status times stored to the second) |
 | `internal/controller/analysis_test.go` | through the real HTTP client and a fake Prometheus API: a passing analysis promotes (3 checks in a 3 s pause at 1 s), a failing one rolls back (Warning Events, both conditions, the stable back, the canary drained, no more queries), the progress deadline rolls back on its requeue, no Prometheus fails closed, a hung Prometheus fails at the timeout; a rolled-back rollout's writes counted, and none in the hold |
 | `internal/controller/undecodable_test.go` | a rollout with a probe port beyond int32 (accepted, undecodable) gets `InvalidSpec` on its own status while another rollout keeps being reconciled |
 | `internal/controller/rollout_test.go` (`TestARolloutsWrites`) | a whole rollout's writes counted at the operator's own client, and none in the two seconds after it ends: a guard against a reconcile that writes in a loop (a status carrying the time wrote 984 patches in those two seconds) |
@@ -253,13 +254,38 @@ holds); documented under limitations with the 0s case, which has the same fix, a
   test took less than one, so a reset start time looked the same. I committed it chained after the mutant run
   anyway (`cdd6226`, whose message says the mutant fails); `b4ed977` gives each operator a fixed clock and says so.
 
+## Review of day 3
+
+One review agent at `b6c6b35` (18 minutes, its own worktree, findings as failing tests, kept as `review_d3_*`) found
+no capacity defect. It wrote a stronger walk (`TestReviewD3Walks`: 6,000 walks that also delete either Deployment,
+during the hold too, edit the steps, interval, deadline and failure limit, remove and add the analysis, set the
+template back to a rolled-back revision, and store status times to the second), which passed. It reproduced:
+
+- **Medium: a failed version could become the stable at all replicas.** Day 3 stops a deleted stable from being
+  recreated from a rolled-back template, but only once `RolledBack` was written. With the rollback's status write lost
+  (or the deadline passing while the operator was down), deleting the stable recreated it from the failed template,
+  phase `Healthy`. Fixed (`a005015`): when the status alone says the rollout failed and the stable is gone, the
+  rollback is recorded and nothing created.
+- **Low: two checks 100 ms apart.** My rounded-down check times let a reconcile right after a late check run another
+  (one bad moment counted twice). Fixed (`a005015`): `lastCheckAt` is a `MicroTime`, and a step with analysis passes on
+  a check made at or after its pause's end, so checks stay an interval apart and drift can't skip the last one.
+- **Low: `--prometheus-url http://p:9090?` was accepted**, and every query then asked Prometheus's UI. Refused now.
+- **Low (arguable): a partial answer passed.** A "success" with warnings (a store down behind Thanos, Cortex or Mimir)
+  may leave out the failing series. It fails the query now, except `PromQL info:` annotations.
+
+It also listed five mechanisms it could break with every test passing: the wait's start rounded up, `AnalysisFailed`'s
+action, the Event note and the `AnalysisPassing` message cut to 1 KiB, and the canary kept in a hold with the stable
+gone. Each has a test now and each mutant fails it (`2aa772f`); without the cut, the API server refuses the Event and
+it is lost. Its unreproduced suspicion, that a rolled-back canary's unready pods could hold a namespace's quota, is
+under limitations.
+
 ## What went wrong on day 3
 
 Found by my own tests and reading, before the review:
 
 - **A 1s interval checked every 2s.** I rounded each check's time up to the second, as day 2 rounds pause starts;
-  each next check then came up to a second late. The envtest test counted 2 queries in a 3 s pause instead of 3.
-  Check times are rounded down now (a pause start still rounds up: there the error points the other way).
+  each next check then came up to a second late. The envtest test counted 2 queries in a 3 s pause instead of 3. I
+  rounded down instead, which the review then showed wrong the other way (below); check times are microseconds now.
 - **The hold after a rollback overwrote why it rolled back.** The `Progressing` message was rewritten on the next
   reconcile with a generic one; the envtest deadline test caught it. The hold keeps the rollback's message now.
 - **A capacity drop**, found by the analysis random walk's first run: a step held past its 0s pause for its first
@@ -304,6 +330,8 @@ build.
 - `AnalysisPassing` shows the last check run, which after a new rollout starts may be the previous rollout's until the
   first check (its message names the step and check number).
 - After a rollback, a deleted stable isn't recreated until the template changes (it would run the failed version).
+- A rolled-back canary keeps all its pods, ready or not, until the stable is back; with a tight ResourceQuota its
+  unready pods could hold the quota the stable needs (not reproduced; DESIGN.md, "Limitations").
 - Editing the steps or `replicas` mid-pause restarts the step's pause (its pods change).
 - A status write lost at a step advance can make the step run again in two cases: the step's pause was 0s (the one
   decision that passed it is the lost one), or `replicas` went up before the next reconcile (the canary then has
