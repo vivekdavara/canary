@@ -4,10 +4,11 @@ A Kubernetes operator for canary rollouts. A `CanaryRollout` holds a pod templat
 operator runs the new version beside the old one in steps (10% of the pods, then 50%, ...), checks Prometheus metrics
 against thresholds at each step, and either promotes the new version or rolls it back.
 
-Status: **day 2 of 5**: the operator runs rollouts. On a template change it starts the new version in a canary
-Deployment beside the stable one, moves pods to it step by step (each step's pause running once its pods are ready),
-and promotes it after the last step, without ever dropping below `replicas` ready pods. Steps advance on their pauses
-alone so far: the metric analysis and rollback are day 3's. [DESIGN.md](DESIGN.md) is the specification;
+Status: **day 3 of 5**: the operator runs rollouts and decides them. On a template change it starts the new version
+in a canary Deployment beside the stable one, moves pods to it step by step (each step's pause running once its pods
+are ready), checks Prometheus metrics during each pause, and promotes the new version after the last step or rolls it
+back (a failed analysis, or a step whose pods aren't ready by the progress deadline), without ever dropping below
+`replicas` ready pods. A run on a real cluster (kind, in CI) is day 4's. [DESIGN.md](DESIGN.md) is the specification;
 [WALKTHROUGH.md](WALKTHROUGH.md) has the questions an interviewer is likely to ask.
 
 Go 1.27, controller-runtime v0.25, Kubernetes 1.37 (envtest locally, kind in CI from day 4). MIT licensed.
@@ -28,15 +29,19 @@ flowchart LR
   op -- "create / scale" --> stable["Deployment web-stable"]
   op -- "create / scale" --> canary["Deployment web-canary"]
   op -- "status, Events" --> api
-  op -- "queries (day 3)" --> prom[(Prometheus)]
+  op -- "instant queries" --> prom[(Prometheus)]
   svc["Service web"] --> stable
   svc --> canary
 ```
 
 The operator owns two Deployments per rollout, and the application's own Service selects the pods of both, so the
 canary's share of the traffic is its share of the pods. Each step scales the canary up first, waits for its pods to
-be ready, then scales the stable down and holds for its pause (from day 3, while the analysis checks the metrics);
-after the last step the stable takes the new version and the canary keeps its pods until the stable's are ready.
+be ready, then scales the stable down and holds for its pause while the analysis checks the metrics every `interval`;
+after the last step the stable takes the new version and the canary keeps its pods until the stable's are ready. A
+check that can't measure fails (an empty answer, NaN, an error, a timeout), and more failed checks than
+`failureLimit`, or a step whose pods aren't ready within `progressDeadlineSeconds`, roll back: the stable goes back to
+all its pods with the old version, the canary keeps its pods until those are ready, and the rollout holds until the
+template changes.
 
 The decisions are one pure function, `rollout.Decide`: from the spec, the last status and the two Deployments it
 returns what each Deployment should become and the next status. The reconciler reads, calls it, writes the
@@ -77,7 +82,8 @@ The full example is [config/samples/web.yaml](config/samples/web.yaml) (a test a
 | `config/rbac/leader_election_role.yaml` | the Role for `--leader-elect`, in the Lease's namespace (written by hand) |
 | `config/samples/` | example rollouts |
 | `internal/revision/` | a template's revision: 16 hex digits of the SHA-256 of its JSON |
-| `internal/rollout/` | the pod split and the state machine (`Decide`), pure functions |
+| `internal/rollout/` | the pod split and the state machine (`Decide`: steps, pauses, checks, the deadline, rollback), pure functions |
+| `internal/analysis/` | a metric's verdict (fails closed), a check of all metrics in parallel, the Prometheus instant-query client |
 | `internal/controller/` | the reconciler: reads, `Decide`, writes the Deployments, the status and the Events |
 | `internal/testenv/` | starts envtest (a real kube-apiserver and etcd) for a package's tests |
 | `cmd/canary/` | the operator's binary |
@@ -100,7 +106,7 @@ kubectl apply --server-side -f config/crd/bases
 ```
 
 ```bash
-go run ./cmd/canary --kubeconfig ~/.kube/config
+go run ./cmd/canary --kubeconfig ~/.kube/config --prometheus-url http://localhost:9090
 ```
 
 ```bash
@@ -113,7 +119,10 @@ creates `web-stable` at 10 pods; change its image and `kubectl get crl -w` shows
 actual share as the pods become ready (`kubectl get deploy -l rollouts.vivekdavara.github.io/rollout=web` shows the
 two Deployments, `kubectl events --for canaryrollout/web` the Events). The operator serves metrics on `:8111` and `/healthz` and `/readyz` on `:8121`. With
 `--leader-elect` (for more than one replica) it also needs `--leader-election-namespace` outside a cluster, and
-`config/rbac/leader_election_role.yaml` bound in that namespace (the Lease and its Events).
+`config/rbac/leader_election_role.yaml` bound in that namespace (the Lease and its Events). Without
+`--prometheus-url`, a rollout with analysis fails its first check and rolls back (it says so in its `AnalysisPassing`
+condition); the sample's queries assume the application exports `http_requests_total` and a latency histogram, and
+that Prometheus keeps the operator's `track` pod label as `track`. `--analysis-timeout` (10s) bounds each query.
 
 ## Tests
 
@@ -129,14 +138,22 @@ play its part: they write a Deployment's status (`markReady`) when its pods woul
 | `internal/controller/review_d2_*_test.go` | the day 2 review's operator findings: a pause's full length (fixed clocks), a rollout being deleted, the role under `OwnerReferencesPermissionEnforcement` (a second API server with that plugin) |
 | `internal/rollout/decide_test.go` (unit) | whole rollouts through a hand-simulated Deployment controller: first apply, steps, pauses timed from readiness, promotion, a restart mid-rollout, a revert, a template change during promotion, a deleted stable, steps shrinking, one pod, a promotion whose status write was lost; and 3,000 seeded random walks (pods settling one Deployment at a time, time passing, new templates, reverts) checking after every decision that ready pods never drop below `replicas`, that the status agrees with itself, and that every walk ends `Healthy` at the template; and 5,000 walks that also edit steps and replicas, change the template mid-rollout, delete either Deployment and lose status writes (each move counted, at least 1,000 times), checking that no decision takes ready pods below `min(replicas, what was ready)` |
 | `internal/controller/rollout_test.go` | a whole rollout against the API server as the operator's own user: the stable's labels, selector, owner and strategy, the stable kept at 4 until the canary's pod is ready, the canary kept during the promotion, the four Events; a 2 s pause ending on its own requeue; a template the API server refuses as a Deployment, then fixed; someone else's Deployment with the rollout's name, reported, and the conflict clearing itself when it's deleted; Deployments deleted by hand coming back |
+| `internal/analysis/analysis_test.go` (unit) | every verdict: inside, on and outside the bounds, no samples, two, NaN, ±Inf, a matrix, a string, an error; the messages (failed metrics first, an error cut at a rune); a check's queries run in parallel (three 50 ms queries in under 140 ms), reported in the metrics' order, each bounded by the timeout; no Prometheus fails them all |
+| `internal/analysis/prometheus_test.go` (unit) | the client against canned API responses: a scalar, one sample, two, none, a matrix, warnings, NaN and ±Inf; each error (`bad_data`, `timeout`, a proxy's HTML page, an empty envelope, a success with a 500, a histogram sample, a bad value, a value that isn't a string, a short sample, an answer over 1 MiB); a hung server and a closed one; the URL's validation |
+| `internal/rollout/rollback_test.go` (unit) | the deadline (rolls back on its exact second; per step), a rollback with the stable down (the canary kept until the stable is back), checks every interval (four in a 2m pause at 30s), a pause shorter than the interval, the failure limit (failures tolerated, then the rollback, each a Warning), checks starting over with the pause, a deleted stable after a rollback (not recreated from the failed template), template changes after a rollback, a lost rollback write, a due check holding the step, a 1s interval with late reconciles, the hold keeping the rollback's message, a lowered limit, the walk's capacity case |
+| `internal/rollout/walk_analysis_test.go` (unit) | 4,000 random walks with checks passing or failing at random, the deadline, slow and lost pods, lost status writes, new templates, `replicas` and `failureLimit` edits; after every decision: capacity, a rollback never touching the stable's template, a held rollout never growing the canary or promoting the rolled-back revision, a step passing only after a check and within the limit, the status consistent; every walk ends `Healthy` or held after its rollback; a census makes sure each case happens at least 300 times |
+| `internal/controller/analysis_test.go` | through the real HTTP client and a fake Prometheus API: a passing analysis promotes (3 checks in a 3 s pause at 1 s), a failing one rolls back (Warning Events, both conditions, the stable back, the canary drained, no more queries), the progress deadline rolls back on its requeue, no Prometheus fails closed, a hung Prometheus fails at the timeout; a rolled-back rollout's writes counted, and none in the hold |
 | `internal/controller/undecodable_test.go` | a rollout with a probe port beyond int32 (accepted, undecodable) gets `InvalidSpec` on its own status while another rollout keeps being reconciled |
 | `internal/controller/rollout_test.go` (`TestARolloutsWrites`) | a whole rollout's writes counted at the operator's own client, and none in the two seconds after it ends: a guard against a reconcile that writes in a loop (a status carrying the time wrote 984 patches in those two seconds) |
 | `internal/controller/reconcile_test.go` | `Reconcile` called by hand through an interceptor client: a status computed from a spec that changed before the patch is refused (the optimistic lock); a reconcile with nothing new writes nothing; a second operator (fixed clocks, ten minutes apart) keeps a paused step's start time |
 | `internal/controller/canaryrollout_controller_test.go` | status follows the spec through template and replica changes; fields the reconciler doesn't own are kept; a missing rollout is no error |
-| `cmd/canary/main_test.go` | the binary from its flags and a kubeconfig: probes answer, a rollout is reconciled, the reconcile is counted in its metrics, a clean stop; with `--leader-elect` it takes the Lease using only the leader-election Role; `--help` |
+| `cmd/canary/main_test.go` | the binary from its flags and a kubeconfig: probes answer, a rollout is reconciled, the reconcile is counted in its metrics, a clean stop; with `--leader-elect` it takes the Lease using only the leader-election Role; `--help`; bad `--prometheus-url` and `--analysis-timeout` values refused with the flag named |
 | `config/install_test.go` | the README's install steps with envtest's kubectl: client-side apply of the CRD fails ("Too long"), `--server-side` works, the sample applies, `kubectl get crl` shows the columns |
 
-Checks that the tests can fail, each run as a mutant: removing any one of the three capacity rules in `Decide` fails
+Checks that the tests can fail, each run as a mutant. Day 3: letting a step held for its first check scale an
+oversized canary down fails `TestRandomWalksWithAnalysis` and `TestAStepHeldForItsCheckKeepsTheCanaryWhileTheStableIsShort`;
+comparing the failure limit only after a failed check fails the walk and `TestALoweredFailureLimitRollsBack`. Day 2:
+removing any one of the three capacity rules in `Decide` fails
 `TestRandomWalks`; the old typed watch fails `TestOneUndecodableRolloutDoesNotStopTheOthers`; a patch without the
 optimistic lock fails `TestAStatusFromAnOlderSpecIsNotWritten`; dropping either "nothing changed" early return fails
 `TestAReconcileWithNothingNewWritesNothing`; not passing `stepStartedAt` to `Decide` fails

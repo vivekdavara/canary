@@ -2,7 +2,7 @@
 
 Questions an interviewer is likely to ask about Canary, with short answers grounded in the code. Day 1 covered the
 design, the API and its validation, revisions and the test setup; day 2 the rollout itself (the split, the state
-machine, the reconciler's reads and writes); the analysis and rollback are day 3's.
+machine, the reconciler's reads and writes); day 3 the analysis and rollback.
 
 ## The idea
 
@@ -197,6 +197,112 @@ nothing until the template changes (`TestATemplateTheAPIServerRefuses`).
 **Why does `status` being a subresource matter?**
 Updates to the object can't change the status and status updates can't change the spec, and only spec changes move
 `metadata.generation`, which is what `observedGeneration` is compared with (`TestStatusIsASubresource`).
+
+## The analysis
+
+**How does a check decide pass or fail?**
+Each metric's query goes to Prometheus as an instant query (`internal/analysis/prometheus.go`), and `Evaluate`
+(`analysis.go`) passes it only on exactly one finite number within `[min, max]`, both bounds inclusive. Everything
+else fails: an empty vector, two samples, NaN, ±Inf, a matrix, an API error, a proxy's HTML page, a 500, an answer
+over 1 MiB, a refused connection, a timeout. A check passes when every metric does (`Check.Passed`). The table in
+`TestEvaluate` lists each case, and `TestPrometheusErrors` each malformed answer.
+
+**Why fail closed?**
+A check that passes when it can't measure would promote a version nobody measured, which is the one thing a canary
+exists to prevent. Failing closed during a Prometheus outage costs a rollback of a possibly good version: a retry,
+with the Events and the `AnalysisPassing` condition naming the metric and the error. `failureLimit` is there to ride
+out short outages. Without `--prometheus-url` every check fails with a message naming the flag
+(`TestWithoutPrometheusAnAnalysisFailsClosed`).
+
+**`Decide` is pure, but a check is I/O. How do they fit?**
+Two calls. A decision whose check is due returns `AnalysisDue` and otherwise holds the step; the reconciler runs the
+check and calls `Decide` again with the same input (the same clock reading) plus the result in `Input.Check`. The
+second decision records the check, updates the counts, sets `AnalysisPassing`, and rolls back if the failures pass
+the limit, all in one decision, so the status write that follows covers it (`reconcile` in
+`internal/controller/canaryrollout_controller.go`). The pure tests do the same in `world.run`, so every test of
+`Decide` exercises the same two-call path.
+
+**When do checks run?**
+One interval after the step's pause starts, then every interval after the last. Not at the start: the canary's pods
+have just become ready, a `rate(...[1m])` over them is empty, and empty fails closed. A step with analysis passes only
+when its pause is over and it has had at least one check, so a 0s pause lasts one interval
+(`TestAPauseShorterThanTheIntervalWaitsForACheck`); with a 2m pause and 30s interval the checks are at 30, 60, 90 and
+120 s and the step passes on the last (`TestChecksRunEveryIntervalDuringThePause`).
+
+**Why round a check's time down when pause starts are rounded up?**
+Both because the API server stores status times to the second, but the errors point different ways. A pause start
+rounded down would end the pause early, so it's rounded up. A check time rounded up delays the next check, by up to a
+second each time, which compounds: a 1s interval checked every 2s, which the envtest test caught (2 queries in a 3 s
+pause instead of 3). Rounded down, the next check is due at most an interval after the last
+(`TestASecondIntervalChecksEverySecond`).
+
+**What happens to the checks when someone edits the rollout mid-step?**
+They belong to the pause. An edit that changes the step's pods (`replicas`, the steps) restarts the pause and clears
+the checks and failures with it (`TestChecksStartOverWithThePause`). The failure limit is read at every decision, so
+lowering it below the failures so far rolls back at once (`TestALoweredFailureLimitRollsBack`; before that fix, a
+step could pass with more failures than the spec allowed).
+
+**What if a check's status write is lost?**
+The check is due again on the next reconcile and runs again; the lost result was never counted, and its
+`AnalysisFailed` Event never went out (Events are recorded only after the status write). The random walk loses writes
+in 2,000+ decisions that ran a check.
+
+**Doesn't a slow Prometheus block the operator?**
+Up to `--analysis-timeout` (10 s) per check: reconciles run one at a time and the check runs inside one, so other
+rollouts wait that long at worst. The metrics of one check are queried in parallel (`TestRunChecksEveryMetricInParallel`),
+and a hung server fails the check at the timeout (`TestASlowPrometheusFailsTheCheckAtTheTimeout`). Raising
+`MaxConcurrentReconciles` would isolate rollouts from each other; it isn't done.
+
+**Could a user make the operator query an arbitrary URL?**
+No: the Prometheus address is the operator's flag, not a rollout field. A rollout controls only the PromQL text, which
+goes to that one server as a form field.
+
+## Rollback
+
+**What triggers a rollback?**
+Two things (`Decide` in `internal/rollout/decide.go`): a step whose canary pods aren't ready within
+`progressDeadlineSeconds` of the step starting to wait (`waitForCanary`), and more failed checks in a step than
+`failureLimit`. Both go through `rollBack`.
+
+**What does a rollback do?**
+Phase `RolledBack`, `rolledBackRevision` set, a Warning `RolledBack` Event with the cause, `Progressing` False with
+the cause. The stable goes back to `replicas` pods with the template it already has (the old version); the canary
+keeps its pods until those are all ready, then goes to 0 (`holdBack`), the same capacity rule as a promotion
+(`TestARollbackKeepsTheCanaryUntilTheStableIsBack`). Then it holds: while the template is still the failed revision,
+nothing is retried, and the next reconciles change nothing and write nothing (`TestARolledBackRolloutsWrites` checks two
+quiet seconds).
+
+**How does the deadline fire if nothing changes?**
+`waitForCanary` returns a requeue at the deadline, so the operator wakes itself. `TestTheProgressDeadlineRollsBack` uses
+a 2 s deadline and a canary that never gets ready: nothing else happens, and the rollout rolls back on time.
+
+**How does a user find out why it rolled back?**
+The `Progressing` condition's message is written at the rollback and kept while the rollout holds (`KeepMessage`; an
+envtest test caught the hold overwriting it with a generic one). The `AnalysisPassing` condition has the last
+check's values against their bounds, and the Events (`AnalysisFailed`, `RolledBack`) have the history while they last.
+
+**Why can't you roll back during a promotion?**
+Promotion gives the stable Deployment the new template, and that template was the only copy of the old version: the
+operator keeps no other. A version only gets there after passing every step and check.
+
+**What if someone deletes the stable Deployment after a rollback?**
+Normally a deleted stable is recreated from the template. After a rollback the template is the failed version, so
+that would run it at all replicas with no canary and no analysis. The operator creates nothing and says so; the next
+template change recreates it (`TestADeletedStableAfterARollback`).
+
+**How do I retry a rolled-back version?**
+Change the template: the hold ends at any template change. To retry the exact same version, change something
+harmless in the template (an annotation), which makes it a new revision. A rolled-back revision set again after
+another rollout has started is rolled out again (`TestAfterARollbackTheTemplateChanges`).
+
+**How did you test rollback beyond the examples?**
+`TestRandomWalksWithAnalysis`: 4,000 walks with checks passing or failing at random (per walk, a 100%, 97%, 80% or 30%
+pass rate), the deadline, slow and lost pods, lost status writes, new templates, `replicas` and `failureLimit` edits.
+After every decision it checks capacity, that a rollback never touches the stable's template, that a held rollout
+never grows the canary or promotes the failed revision, and that a step only passes after a check and within the
+limit; every walk must end `Healthy` or held. A census makes sure each case happens (about 1,300 rollbacks by
+analysis, 4,100 by the deadline, 2,800 tolerated failures). Its first run found a capacity drop ("What went wrong on
+day 3").
 
 ## Testing
 
