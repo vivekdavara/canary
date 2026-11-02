@@ -32,7 +32,7 @@ flowchart LR
   precision (see "Limitations").
 - **Prometheus** answers the analysis queries. Its address is the operator's flag (`--prometheus-url`), not a field
   of the rollout, so whoever can create a `CanaryRollout` can't make the operator send requests to an address of
-  their choosing. Tests use a fake behind the same interface (day 3).
+  their choosing. Tests use a fake Prometheus HTTP API (and fakes behind the `Querier` interface).
 
 ## The API: `CanaryRollout` (`rollouts.vivekdavara.github.io/v1alpha1`)
 
@@ -135,13 +135,15 @@ Why these choices:
 | `updateRevision` | the revision of `spec.template` (below) |
 | `stableRevision` | the revision of the stable Deployment's template (its revision label); a promotion sets it when it starts, while the stable's pods are still being replaced |
 | `canaryRevision` | the revision under test, empty when none |
-| `rolledBackRevision` | the last revision rolled back, so it isn't retried until the template changes (day 3) |
-| `phase` | `Healthy`, `Progressing`, `Promoting` or `RolledBack` (day 3) |
-| `currentStep` | the index of the step in progress (the last one during `Promoting`) |
+| `rolledBackRevision` | the last revision rolled back, kept until another rollback replaces it; while it is the template's and the phase is `RolledBack`, the rollout holds |
+| `phase` | `Healthy`, `Progressing`, `Promoting` or `RolledBack` |
+| `currentStep` | the index of the step in progress (the last one during `Promoting`; after a rollback, the step that failed) |
 | `stepStartedAt` | when the current step's pods became ready and its pause began; cleared when the step ends |
+| `stepWaitingSince` | when the current step began waiting for its canary pods; the progress deadline runs from it; cleared when its pause begins |
+| `analysis` | the current step's checks: `checks`, `failedChecks`, `lastCheckAt`; they start over with the step's pause (after a rollback, those of the step that failed) |
 | `stableReplicas`, `canaryReplicas` | ready pods of each, as last read |
 | `canaryWeight` | the canary's actual share of the ready pods, in percent, rounded down |
-| `conditions` | `Progressing`, `Available` ("Conditions" below), `AnalysisPassing` (day 3) |
+| `conditions` | `Progressing`, `Available`, `AnalysisPassing` ("Conditions" below) |
 
 **The revision** of a template is the first 16 hex digits of the SHA-256 of its JSON encoding. Go's encoder writes
 struct fields in a fixed order and map keys sorted, so the same template gets the same revision in every process.
@@ -150,7 +152,7 @@ kept: `1Gi` and `1073741824` are equal and get different revisions, so rewriting
 a rollout of what is the same template (`TestQuantityFormatIsPartOfTheRevision`). It goes on the pods as a label, so 16 hex digits
 (64 bits) also keeps it well inside the 63-character limit for label values.
 
-## The rollout (day 2; rollback is day 3's)
+## The rollout (day 2; the analysis and rollback, day 3)
 
 ### Splitting the pods
 
@@ -176,14 +178,16 @@ stateDiagram-v2
   Progressing --> Promoting: last step passed
   Promoting --> Healthy: stable ready at the new revision, canary to 0
   Progressing --> Healthy: template changed back to the stable revision
-  Progressing --> RolledBack: deadline passed or analysis failed (day 3)
-  RolledBack --> Progressing: template changed (a new revision, day 3)
+  Progressing --> RolledBack: deadline passed, or more failed checks than the limit
+  RolledBack --> Progressing: template changed to a new revision
+  RolledBack --> Healthy: template changed back to the stable revision
 ```
 
 `rollout.Decide` is the whole state machine as one pure function: from the spec, the template's revision, the last
 status and what the operator read of its two Deployments, it returns each Deployment's target (replicas, and whether
 its pod template becomes the rollout's), the next status, the `Progressing` condition's reason and message, when to
-be woken (the end of a pause) and the Events to record. The reconciler only reads, calls it, and writes.
+be woken (the end of a pause) and the Events to record. The reconciler only reads, calls it, and writes (and, when the decision says a check is due, runs the check and calls
+it again: "Analysis", below).
 
 1. **First apply.** There is nothing to compare a first version with, so the operator creates the stable Deployment
    from the template at `replicas` pods, and no canary. Phase `Healthy`. The same happens if the stable Deployment is
@@ -200,8 +204,8 @@ be woken (the end of a pause) and the Events to record. The reconciler only read
    count, and a pod lost later doesn't restart it). The start is rounded up to a whole second, because the API
    server stores status times to the second: a start written with its fraction and read back truncated would end
    the pause up to a second early. When the pause is over the next step begins; a step with a 0s pause passes
-   straight through, so the stable never goes down to that step's count. Day 3 adds the analysis at the end of the
-   pause and the `progressDeadlineSeconds` rollback.
+   straight through, so the stable never goes down to that step's count. With analysis, the step also needs a passing
+   verdict ("Analysis", below), and the wait for its pods is bounded by the progress deadline ("Rollback", below).
 
    **A pause belongs to the pods it started with.** If the canary no longer runs the template's revision (a status
    write was lost while the template changed and changed back), or is set to another count than the step's (the
@@ -245,7 +249,7 @@ decision (pods ready, pause over, next step) loses its write runs again, since t
 passed (the status never recorded its start); and a lost advance followed by a `replicas` increase leaves the canary
 with fewer pods than the step now needs, which looks like an edit, so the step's pause runs again (the fourth review
 round). Capacity holds in both and the new version's share only shrinks; it costs a pod or a second pause. Fixing
-them means recording the step on the canary Deployment, written with its replicas (day 3).
+them means recording the step on the canary Deployment, written with its replicas (not done yet).
 
 The operator keeps no state of its own: everything it needs is in the status (phase, `canaryRevision`,
 `currentStep`, `stepStartedAt`) and the two Deployments (the revision each runs is its pod template's revision label),
@@ -262,7 +266,8 @@ to be requeued at the end of a pause; everything else wakes it through its watch
    the Deployments it owns, the operator watches Deployments with a rollout's names that no rollout controls, so
    deleting such a Deployment wakes the rollout and the conflict clears itself (`TestSomeoneElsesDeploymentWithTheName`).
    A Deployment of the rollout's deleted by hand comes back at the next reconcile (`TestADeletedDeploymentComesBack`).
-3. `Decide`.
+3. `Decide`. If it says a check is due, run the check (each query bounded by `--analysis-timeout`) and `Decide` again
+   with its result ("How a check fits a pure state machine", below).
 4. **Write the Deployments**: create one the plan needs, or update its replicas, and its pod template when the plan
    takes the template and the revision label differs. Updates carry the `resourceVersion` read, so a stale cache read
    gets a conflict instead of undoing a newer write; a conflict ends the reconcile (the newer object is an event of its
@@ -302,26 +307,104 @@ cache: the API server validated them in full.
   `OwnerReferencesPermissionEnforcement` admission plugin (OpenShift does; a test starts an API server with it);
   Deployments list, watch, create, update (reads come from the cache, so no get); Events create and patch.
 - Events (events.k8s.io/v1) on the rollout: `RolloutStarted`, `StepAdvanced`, `Promoting`, `Promoted`,
-  `RolloutReverted` (Normal); `InvalidSpec`, `DeploymentConflict` (Warning). Day 3 adds `RolledBack` and
-  `AnalysisFailed`.
+  `RolloutReverted` (Normal); `InvalidSpec`, `DeploymentConflict`, `AnalysisFailed` (each failed check, with every
+  metric's value), `RolledBack` (Warning). A note is cut to 1 KiB, the API's limit for an Event's note (a longer one
+  is refused and the Event lost).
 
 ### Conditions
 
 | Type | Status | Reasons |
 |---|---|---|
 | `Progressing` | True while a rollout runs | `WaitingForCanary` (a step's canary pods aren't all ready), `StepPaused` (its pause is running; the message says until when), `Promoting` |
-| `Progressing` | False otherwise | `Idle` (no rollout), `InvalidSpec` (undecodable, or a Deployment refused), `DeploymentConflict` |
+| `Progressing` | False otherwise | `Idle` (no rollout), `RolledBack` (the message says why, and is kept while the rollout holds), `InvalidSpec` (undecodable, or a Deployment refused), `DeploymentConflict` |
 | `Available` | True or False | `EnoughPodsReady` or `NotEnoughPodsReady`: whether the two Deployments' ready pods add up to `replicas` |
+| `AnalysisPassing` | True or False | `ChecksPassed` or `CheckFailed`: the last check, written when one runs: the step, the check's number, the failures so far and the limit, and every metric's value against its bounds (failed metrics first) |
 
 The rollout's name becomes a prefix of Deployment and pod names, so the API server limits it to 50 characters.
 
 ## Analysis (day 3)
 
-Each metric's `query` is sent to Prometheus as an instant query. The result must be one number: a scalar, or a vector
-with exactly one sample. The check fails when the number is below `min` or above `max`, and also when the result is
-empty, has more than one sample, is NaN or infinite, or the query errors or times out: an analysis that can't
-measure doesn't pass (it fails closed). A step's checks fail the step when more than `failureLimit` of them have
-failed since the step began.
+### A metric's verdict
+
+Each metric's `query` is sent to Prometheus as an instant query (`POST /api/v1/query`, the query as a form field so a
+long one fits, evaluated at Prometheus's own time). The answer must be one number: a scalar, or a vector with exactly
+one sample. The metric passes when that number is within `[min, max]`, both inclusive. It fails in every other case:
+below `min` or above `max`, NaN or infinite, an empty vector, more than one sample, a matrix or a string, a
+native-histogram sample, an API error (`bad_data`, `timeout`, ...), an answer that isn't the API's (a proxy's HTML
+error page), a success with an HTTP error code, an answer over 1 MiB, a refused connection, or no answer within the
+operator's `--analysis-timeout` (10s by default). An analysis that can't measure doesn't pass: it fails closed.
+Without `--prometheus-url` every check fails, with a message naming the flag. A **check** runs every metric once (in
+parallel) and passes when all of them pass (`internal/analysis`: `Evaluate` is the verdict, `Run` the check,
+`Prometheus` the client).
+
+Why fail closed: a check that passes when it can't measure would promote a version nobody measured. The opposite
+mistake, rolling back a good version during a Prometheus outage, costs a retry, and the Events and the
+`AnalysisPassing` condition say which metric couldn't be read and why. `failureLimit` tolerates short outages.
+
+### When checks run
+
+Checks belong to a step's pause. The first is due one `interval` after the pause starts (a check at the very start
+would measure pods that have had no traffic yet, and an empty answer fails), and each next one an `interval` after the
+last. A step with analysis passes only when its pause is over **and** it has had at least one check, so a pause
+shorter than the interval (a 0s pause included) lasts until the first check. With a 2m pause and a 30s interval, the
+checks run at 30s, 60s, 90s and 120s, and the step passes on the last.
+
+Each check's time is kept rounded *down* to the second (the API server stores status times to the second), so the
+next check is due at most an interval after it. Rounded up, every check would be up to a second late, and a 1s
+interval checked only every 2s (an envtest test found that).
+
+The checks start over with the pause: an edit that restarts a step's pause (its pods change) also clears its checks
+and failures. `analysis.failureLimit` is read at every decision during a pause: more failed checks than the limit
+roll back, right after a failed check or as soon as the limit is lowered below the failures so far.
+
+### How a check fits a pure state machine
+
+`Decide` stays pure. A decision whose check is due says so (`Plan.AnalysisDue`) and otherwise just holds the step; the
+reconciler then runs the check (`analysis.Run`) and calls `Decide` again with the same input, the same clock reading
+included, plus the result (`Input.Check`). The second decision records it: `analysis.checks` and, if it failed,
+`failedChecks` go up, `lastCheckAt` is set, the `AnalysisPassing` condition gets the result, a failed check records a
+Warning `AnalysisFailed` Event, and more failures than the limit roll back in the same decision. The unit tests run
+checks the same way (`world.run` in `internal/rollout/decide_test.go`).
+
+A check whose status write is lost (a conflict) is due again at the next reconcile and runs again: the lost result
+isn't counted, and its Event isn't recorded (Events go out only after the status write).
+
+## Rollback (day 3)
+
+Two things roll a rollout back:
+
+- **The progress deadline.** A step that began waiting for its canary pods `progressDeadlineSeconds` ago (600 by
+  default) and still has no pause running. The wait starts when the step does (`stepWaitingSince`: a new rollout, the
+  next step, a pause that restarts after an edit) and ends when the step's pods are ready. The operator asks to be
+  woken at the deadline, so it fires with no other event. It covers anything that keeps a step from starting: canary
+  pods that crash or can't be scheduled, and a stable that must be back to its count before an oversized canary may
+  shrink.
+- **The analysis.** More failed checks in a step than `failureLimit`.
+
+A rollback (`phase: RolledBack`, `rolledBackRevision` set, `canaryRevision` cleared, a Warning `RolledBack` Event, and
+`Progressing` False with reason `RolledBack` and the cause) takes the stable back to `replicas` pods with the template
+it has, the old version, and keeps the canary's pods until the stable's are all ready; then the canary goes to 0. The
+rollout then **holds**: while the template is the revision rolled back, nothing is retried, and the `Progressing`
+message written at the rollback (why it failed) is kept. A template change ends the hold: a new revision starts a
+rollout, and the stable's own revision is simply `Healthy`. To retry the same version, change something in the
+template (an annotation will do), which makes it a new revision.
+
+Rules, and why:
+
+- **No rollback once promotion starts.** Promotion gives the stable Deployment the new template, and the stable's
+  template was the only copy of the old version, so there is nothing left to roll back to. A version reaches promotion
+  only after passing every step.
+- **A deleted stable isn't recreated from a rolled-back template.** Otherwise a deleted stable is recreated from the
+  template ("The state machine", 1). After a rollback the template *is* the failed version, and recreating the stable
+  from it would run that version at all replicas with no canary and no analysis. The operator creates nothing and
+  says so (`Progressing` False, `RolledBack`, "the stable Deployment is gone ... set the template to the version to
+  run"); a template change recreates it.
+- **A rollback whose status write is lost is decided again.** The Deployments are written first, so the stable may
+  already be back at `replicas`. The next decision rolls back again if the deadline is still past; after a failed
+  check, a new check runs, and if that one passes the rollout carries on and the stable comes back down to the step's
+  count (capacity holds throughout).
+- **The canary drains under the capacity rules.** A new rollout started while a rolled-back canary still drains treats
+  it as any canary with more pods than its step's (`waitForCanary`): kept until the stable is settled.
 
 ## Testing
 
@@ -335,8 +418,9 @@ failed since the step began.
 - **The manifests are applied with kubectl**, the version envtest downloads with the API server, as the README says
   to (`config/install_test.go`).
 - **Unit tests** for the pure parts: revisions, the split (every allowed input), the state machine (whole rollouts
-  through a hand-simulated Deployment controller, and 3,000 seeded random walks checking capacity, the status's
-  consistency and that every walk ends `Healthy`), the analysis's verdicts (day 3).
+  through a hand-simulated Deployment controller, and seeded random walks checking capacity, the status's consistency
+  and how every walk ends, with analysis and the deadline in `TestRandomWalksWithAnalysis`), the analysis's verdicts
+  and the Prometheus client against canned API responses.
 - **The reconcile's own mechanisms** are tested by calling `Reconcile` by hand through an interceptor client: the
   optimistic lock (the spec changes between read and patch), and that a reconcile with nothing new writes nothing.
 - **kind** in CI on day 4: a real cluster with a real Deployment controller, one rollout that passes and one that
@@ -352,4 +436,11 @@ failed since the step began.
   without `omitempty` would give every unchanged template a new revision, and so start a rollout of everything it
   manages. `TestRevisionIsPinned` pins one template's revision so such an upgrade fails a test instead of shipping;
   the fix then would be to compare templates semantically rather than by hash.
-- No HorizontalPodAutoscaler integration, no manual pause or approval, no webhook-based analysis.
+- **Reconciles run one at a time**, and a check runs inside one, so a slow Prometheus holds up other rollouts by up to
+  `--analysis-timeout` per check (the metrics of one check are queried in parallel).
+- **The progress deadline runs per step from when the step began waiting**, and edits during the wait (more replicas)
+  don't restart it.
+- **`AnalysisPassing` describes the last check run**, possibly of an earlier rollout: it is written only by checks
+  (its message names the step and the check's number).
+- No HorizontalPodAutoscaler integration, no manual pause, approval or abort, no webhook-based analysis, no
+  rollback after promotion has started.
