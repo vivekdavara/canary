@@ -324,20 +324,25 @@ func TestADueCheckHoldsTheStep(t *testing.T) {
 	}
 }
 
-// A 1s interval checks about every second even when reconciles come a fraction late: each check's time is kept rounded
-// down to the second (as the API server stores it), so the next is never pushed later. A 3s pause gets three checks.
+// A 1s interval checks every second, each check an interval after the last and the step ending on a check at or after
+// its pause's end. With each reconcile coming when the last one's requeue asked, 5 ms late, a 3s pause gets three
+// checks (1.005s, 2.010s, 3.015s): no drift skips the last one. (The envtest test found checks rounded up to the
+// second coming every 2s; TestReviewD3ChecksAreAnIntervalApart, checks rounded down running 100 ms apart.)
 func TestASecondIntervalChecksEverySecond(t *testing.T) {
 	w := newWorld(t, 2, step(50, 3*time.Second)).withAnalysis(time.Second, 0).started()
 	w.now = w.now.Add(300 * time.Millisecond)
 	w.settle()
-	w.run() // the pause starts at the next whole second
+	p := w.run() // the pause starts at the next whole second
 	start := w.state.StepStartedAt.Time
-	for _, late := range []time.Duration{1300, 2050, 3000} {
-		w.now = start.Add(late * time.Millisecond)
-		w.run()
+	var at []time.Duration
+	for w.state.Phase == v1.PhaseProgressing && len(at) < 5 {
+		w.now = w.now.Add(p.RequeueAfter + 5*time.Millisecond)
+		p = w.run()
+		at = append(at, w.now.Sub(start))
 	}
-	if w.checked != 3 || w.state.Phase != v1.PhasePromoting {
-		t.Fatalf("%d checks, state %+v; want 3 and the step passed", w.checked, w.state)
+	want := []time.Duration{1005 * time.Millisecond, 2010 * time.Millisecond, 3015 * time.Millisecond}
+	if w.checked != 3 || w.state.Phase != v1.PhasePromoting || !slices.Equal(at, want) {
+		t.Fatalf("%d checks at %v, state %+v; want 3 at %v and the step passed", w.checked, at, w.state, want)
 	}
 }
 
@@ -395,5 +400,41 @@ func TestALoweredFailureLimitRollsBack(t *testing.T) {
 	p := w.run()
 	if w.state.Phase != v1.PhaseRolledBack || w.checked != 1 || !strings.Contains(w.lastEvent(p, EventRolledBack), "1 of step 1 of 1 (10%)'s checks failed, more than the 0 allowed") {
 		t.Fatalf("state %+v, %d checks, events %+v", w.state, w.checked, p.Events)
+	}
+}
+
+// A reconcile at the pause's end, with the next check not yet due, doesn't pass the step: it ends on a check made at
+// or after the pause's end, so the pause's last interval is measured too.
+func TestAStepEndsOnACheckAtOrAfterItsPausesEnd(t *testing.T) {
+	w := newWorld(t, 2, step(50, 3*time.Second), step(100, 0)).withAnalysis(time.Second, 0).started()
+	w.settle()
+	w.run()
+	start := w.state.StepStartedAt.Time
+	for _, at := range []time.Duration{1005, 2010} {
+		w.now = start.Add(at * time.Millisecond)
+		w.run()
+	}
+	w.now = start.Add(3 * time.Second) // the pause is over; the next check is due at 3.010s
+	if p := w.run(); *w.state.CurrentStep != 0 || w.checked != 2 || p.RequeueAfter != 10*time.Millisecond {
+		t.Fatalf("plan %+v, state %+v, %d checks; want step 0 held for the check in 10ms", p, w.state, w.checked)
+	}
+	w.now = start.Add(3010 * time.Millisecond)
+	w.run()
+	if *w.state.CurrentStep != 1 || w.checked != 3 {
+		t.Fatalf("state %+v, %d checks; want step 1 after the third check", w.state, w.checked)
+	}
+}
+
+// A deleted stable with the deadline past counts as a failed rollout only if the step's canary pods still aren't
+// ready: pods ready late (the operator wasn't running at the deadline) start the step as they would on the normal path,
+// so here the deleted stable is recreated from the template, as on day 2, and nothing is rolled back.
+func TestADeletedStableAfterTheDeadlineWithTheCanaryReady(t *testing.T) {
+	w := newWorld(t, 4, step(25, 0)).withDeadline(60).started()
+	w.now = w.now.Add(time.Minute)
+	w.settle() // the canary's pod became ready, but no reconcile came before the deadline
+	w.stable = nil
+	w.run()
+	if w.state.Phase != v1.PhaseHealthy || w.stable == nil || w.stable.Revision != "r2" || len(w.warnings) != 0 {
+		t.Fatalf("state %+v, stable %+v, warnings %v; want the stable recreated from the template, no rollback", w.state, w.stable, w.warnings)
 	}
 }

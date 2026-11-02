@@ -130,7 +130,8 @@ func TestReviewD3Walks(t *testing.T) {
 	t.Logf("census: %v", census)
 }
 
-// truncateTimes is the status as the API server stores it: times to the second.
+// truncateTimes is the status as the API server stores it: times to the second, lastCheckAt (a MicroTime) to the
+// microsecond.
 func truncateTimes(s State) State {
 	tr := func(t *metav1.Time) *metav1.Time {
 		if t == nil {
@@ -138,7 +139,10 @@ func truncateTimes(s State) State {
 		}
 		return &metav1.Time{Time: t.Truncate(time.Second)}
 	}
-	s.StepStartedAt, s.StepWaitingSince, s.Analysis.LastCheckAt = tr(s.StepStartedAt), tr(s.StepWaitingSince), tr(s.Analysis.LastCheckAt)
+	s.StepStartedAt, s.StepWaitingSince = tr(s.StepStartedAt), tr(s.StepWaitingSince)
+	if t := s.Analysis.LastCheckAt; t != nil {
+		s.Analysis.LastCheckAt = &metav1.MicroTime{Time: t.Truncate(time.Microsecond)}
+	}
 	return s
 }
 

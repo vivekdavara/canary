@@ -227,10 +227,11 @@ type AnalysisStatus struct {
 	// +optional
 	FailedChecks int32 `json:"failedChecks,omitempty"`
 
-	// LastCheckAt is when the last check ran; the next is due an interval later.
+	// LastCheckAt is when the last check ran, to the microsecond; the next is due an interval later. (A Time would be
+	// stored to the second, and rounding either way spaces checks wrongly: DESIGN.md, "When checks run".)
 	//
 	// +optional
-	LastCheckAt *metav1.Time `json:"lastCheckAt,omitempty"`
+	LastCheckAt *metav1.MicroTime `json:"lastCheckAt,omitempty"`
 }
 
 // CanaryRollout runs a pod template and moves it to new versions in canary steps.

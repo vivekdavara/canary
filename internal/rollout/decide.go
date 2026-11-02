@@ -51,7 +51,7 @@ type State struct {
 // Analysis counts one step's checks: they begin with its pause, and start over when the pause does.
 type Analysis struct {
 	Checks, FailedChecks int32
-	LastCheckAt          *metav1.Time
+	LastCheckAt          *metav1.MicroTime
 }
 
 // Input is everything a decision depends on.
@@ -188,6 +188,26 @@ func decide(in Input) Plan {
 			Message: fmt.Sprintf("the stable Deployment is gone, and the template is revision %s, which was rolled back: set the template to the version to run", rev),
 		}
 	}
+	// A rollout that has already failed by what its status says (its step's deadline past with the pods still not
+	// ready, or more failed checks than the limit allows) and whose stable is gone: a rollback whose status write was
+	// lost, or a deadline that passed while the operator wasn't running. Recreating the stable from the template would
+	// run the failed version at all replicas, so the rollback is recorded and nothing is created (the hold above
+	// follows). Found by the review of day 3.
+	if stable == nil {
+		if why, failed := alreadyFailed(in); failed {
+			st := last
+			st.Phase, st.RolledBackRevision, st.CanaryRevision = v1.PhaseRolledBack, rev, ""
+			st.StepStartedAt, st.StepWaitingSince = nil, nil
+			return Plan{
+				Canary:  Target{Replicas: replicasOf(canary)},
+				State:   st,
+				Reason:  ReasonRolledBack,
+				Message: fmt.Sprintf("revision %s was rolled back (%s), and the stable Deployment is gone: set the template to the version to run", rev, why),
+				Events: []Event{{Reason: EventRolledBack, Warning: true,
+					Message: fmt.Sprintf("revision %s rolled back: %s; the stable Deployment is gone", rev, why)}},
+			}
+		}
+	}
 	if stable == nil {
 		return Plan{
 			Stable:  Target{Replicas: r, FromTemplate: true},
@@ -309,9 +329,9 @@ func decide(in Input) Plan {
 	end := st.StepStartedAt.Add(pauseOf(in.Spec.Steps[i]))
 	holding := !pauseOver(st.StepStartedAt, in.Spec.Steps[i], in.Now)
 
-	// The analysis: a check every interval from the pause's start, while the pause runs and after it until the step
-	// has had one (a step with analysis passes only after a check, so a pause shorter than the interval lasts an
-	// interval). A check that fails more often than the failure limit allows rolls the rollout back.
+	// The analysis: a check every interval from the pause's start, while the pause runs and until a check at or after
+	// its end (a step with analysis passes only on such a check, so a pause shorter than the interval lasts an
+	// interval). More failed checks than the failure limit allows roll the rollout back.
 	var checked *CheckResult
 	var nextCheck time.Time
 	due := false
@@ -325,10 +345,10 @@ func decide(in Input) Plan {
 				due = true
 			} else {
 				st.Analysis.Checks++
-				// Rounded down, to the second the API server stores: the next check is then due an interval after it,
-				// never later. Rounded up, every check would be up to a second late, and a 1s interval would check
-				// every 2s.
-				st.Analysis.LastCheckAt = &metav1.Time{Time: in.Now.Truncate(time.Second)}
+				// Kept to the microsecond, as the status stores it (a MicroTime), so the next check is due exactly an
+				// interval after this one. To the second, rounding up made each check up to a second late (a 1s interval
+				// checked every 2s), and rounding down let two checks run 100 ms apart (the review of day 3).
+				st.Analysis.LastCheckAt = &metav1.MicroTime{Time: in.Now.Truncate(time.Microsecond)}
 				nextCheck = st.Analysis.LastCheckAt.Add(intervalOf(a))
 				msg := fmt.Sprintf("%s, check %d", stepName(in.Spec, i), st.Analysis.Checks)
 				if in.Check.Passed() {
@@ -348,7 +368,10 @@ func decide(in Input) Plan {
 			p.Checked = checked
 			return p
 		}
-		holding = holding || due || st.Analysis.Checks == 0
+		// A step with analysis passes on a check made at or after its pause's end, so its last check covers the
+		// pause's last interval, and checks stay an interval apart however late reconciles come.
+		endChecked := st.Analysis.LastCheckAt != nil && !st.Analysis.LastCheckAt.Time.Before(end)
+		holding = holding || due || !endChecked
 	}
 	if holding {
 		// The stable goes down to the step's count only while the step's canary pods are all ready: one lost
@@ -371,10 +394,9 @@ func decide(in Input) Plan {
 		}
 		wake := end
 		if a := in.Spec.Analysis; a != nil {
+			// With analysis the step ends on a check, so the next check is the only time due.
 			msg += fmt.Sprintf("; checks: %d, %d failed, the next at %s", st.Analysis.Checks, st.Analysis.FailedChecks, nextCheck.UTC().Format(time.RFC3339))
-			if !in.Now.Before(end) || nextCheck.Before(end) {
-				wake = nextCheck
-			}
+			wake = nextCheck
 		}
 		return Plan{
 			Canary:       Target{Replicas: canaryWant, FromTemplate: true},
@@ -545,6 +567,26 @@ func ceilSecond(t time.Time) time.Time {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// alreadyFailed says whether a rollout in progress has failed by what its last status says alone: its step's
+// progress deadline is past with the step's canary pods still not ready, or its pause has more failed checks than the
+// limit allows. It is for a decision that can't go through the step (the stable is gone).
+func alreadyFailed(in Input) (string, bool) {
+	last := in.Status
+	if last.Phase != v1.PhaseProgressing || last.CanaryRevision != in.Revision {
+		return "", false
+	}
+	i := stepIndex(last.CurrentStep, in.Spec)
+	if a := in.Spec.Analysis; a != nil && last.StepStartedAt != nil && last.Analysis.FailedChecks > failureLimitOf(a) {
+		return fmt.Sprintf("%d of %s's checks failed, more than the %d allowed", last.Analysis.FailedChecks, stepName(in.Spec, i), failureLimitOf(a)), true
+	}
+	c, _ := Split(in.Spec.Replicas, in.Spec.Steps[i].Weight)
+	if last.StepStartedAt == nil && last.StepWaitingSince != nil && !in.Canary.readyAt(in.Revision, c) &&
+		!in.Now.Before(last.StepWaitingSince.Add(progressDeadlineOf(in.Spec))) {
+		return fmt.Sprintf("%s wasn't ready within the progress deadline of %v", stepName(in.Spec, i), progressDeadlineOf(in.Spec)), true
+	}
+	return "", false
+}
 
 // sameTime says a and b are both nil or the same instant.
 func sameTime(a, b *metav1.Time) bool {
