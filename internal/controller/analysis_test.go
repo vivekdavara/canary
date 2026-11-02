@@ -14,6 +14,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	rolloutsv1alpha1 "github.com/vivekdavara/canary/api/v1alpha1"
@@ -285,5 +286,58 @@ func TestARolledBackRolloutsWrites(t *testing.T) {
 		counts[0], counts[1], counts[2], queries)
 	if counts[0] != 2 || counts[1] > 6 || counts[2] > 20 {
 		t.Errorf("(creates, updates, status patches) = %v; want 2, at most 6, at most 20", counts)
+	}
+}
+
+// cancellingQuerier stands for an operator stopping mid-check: the query cancels the reconcile's context and fails
+// with its error, as every query would at a shutdown.
+type cancellingQuerier struct{ cancel context.CancelFunc }
+
+func (q cancellingQuerier) Query(ctx context.Context, _ string) (analysis.Result, error) {
+	q.cancel()
+	<-ctx.Done()
+	return analysis.Result{}, ctx.Err()
+}
+
+// A check cut short because the operator is stopping is no verdict: the reconcile returns the context's error and
+// writes nothing, rather than counting a failure (with no failure allowed, that would have rolled back).
+func TestACheckCutShortByAShutdownIsNoVerdict(t *testing.T) {
+	env := testenv.Get(t)
+	var writes writeCounter
+	r := direct(t, *writes.funcs())
+	now := time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)
+	r.Now = func() time.Time { return now }
+	ns := env.Namespace(t)
+	ro := analysedRollout(ns, time.Hour, 0)
+	if err := env.Client.Create(context.Background(), ro); err != nil {
+		t.Fatal(err)
+	}
+	reconcileOnce(t, r, ro) // the stable
+	markReady(t, env.Client, ns, "web-stable")
+	edit(t, env.Client, client.ObjectKeyFromObject(ro), func(r *rolloutsv1alpha1.CanaryRollout) {
+		r.Spec.Template.Spec.Containers[0].Image = "example.com/web:2"
+	})
+	reconcileOnce(t, r, ro) // the canary
+	markReady(t, env.Client, ns, "web-canary")
+	reconcileOnce(t, r, ro) // the pause starts
+	var before rolloutsv1alpha1.CanaryRollout
+	if err := env.Client.Get(context.Background(), client.ObjectKeyFromObject(ro), &before); err != nil || before.Status.StepStartedAt == nil {
+		t.Fatalf("status %+v, %v; want a pause running", before.Status, err)
+	}
+
+	now = now.Add(time.Minute) // a check is due
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.Querier = cancellingQuerier{cancel}
+	counts := writes.load()
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ro)}); err == nil {
+		t.Fatal("Reconcile = nil; want the context's error")
+	}
+	var after rolloutsv1alpha1.CanaryRollout
+	if err := env.Client.Get(context.Background(), client.ObjectKeyFromObject(ro), &after); err != nil {
+		t.Fatal(err)
+	}
+	if writes.load() != counts || after.Status.Phase != rolloutsv1alpha1.PhaseProgressing || after.Status.Analysis != nil {
+		t.Fatalf("writes %v -> %v, status %+v; want nothing written", counts, writes.load(), after.Status)
 	}
 }

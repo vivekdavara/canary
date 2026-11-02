@@ -166,6 +166,11 @@ func (r *CanaryRolloutReconciler) reconcile(ctx context.Context, ro *rolloutsv1a
 			timeout = DefaultAnalysisTimeout
 		}
 		check := analysis.Run(ctx, r.Querier, ro.Spec.Analysis.Metrics, timeout)
+		if err := ctx.Err(); err != nil {
+			// The operator is stopping (or lost its leadership): the queries were cut short by that, not by
+			// Prometheus, so this is no verdict. The next leader checks again.
+			return ctrl.Result{}, err
+		}
 		in.Check = &check
 		plan = rollout.Decide(in)
 	}
