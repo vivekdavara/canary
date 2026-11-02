@@ -201,3 +201,21 @@ func TestRunHelpIsNotAFailure(t *testing.T) {
 		t.Errorf("run(--help) = %v; want flag.ErrHelp, which main exits 0 on", err)
 	}
 }
+
+// The analysis flags are checked before anything starts: a Prometheus URL the client can't use, or a timeout that
+// would fail every query, is refused with the flag named.
+func TestRunRefusesBadAnalysisFlags(t *testing.T) {
+	for args, want := range map[string]string{
+		"--prometheus-url=prometheus:9090":   "--prometheus-url: the Prometheus URL \"prometheus:9090\": want http:// or https://",
+		"--prometheus-url=http://p/?q=up":    "--prometheus-url: the Prometheus URL \"http://p/?q=up\": want no query",
+		"--analysis-timeout=0s":              "--analysis-timeout must be positive, not 0s",
+		"--analysis-timeout=-1s":             "--analysis-timeout must be positive, not -1s",
+		"--analysis-timeout=10":              "invalid value \"10\" for flag -analysis-timeout",
+		"--prometheus-url=ftp://example.com": "want http:// or https://",
+	} {
+		err := run(context.Background(), []string{args})
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("run(%s) = %v; want an error containing %q", args, err, want)
+		}
+	}
+}
