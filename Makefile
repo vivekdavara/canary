@@ -45,6 +45,7 @@ envtest: $(SETUP_ENVTEST)
 lint:
 	@unformatted="$$(find . \( -path ./.scratch -o -path ./bin \) -prune -o -name '*.go' -print | xargs gofmt -l)"; if [ -n "$$unformatted" ]; then echo "not gofmt-formatted:"; echo "$$unformatted"; exit 1; fi
 	go vet ./...
+	go vet -tags e2e ./test/e2e/
 
 # CANARY_REQUIRE_ENVTEST makes the envtest suites fail, not skip, when they can't find the binaries, so this target
 # (and CI) can't pass by skipping them; a plain `go test ./...` skips them.
