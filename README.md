@@ -199,6 +199,12 @@ two failures allowed:
 | never becomes ready; deadline 20 s | rolled back at the deadline, no checks | 20.3 s / 20.6 s |
 | fails no requests; the leader's pod killed 2.6 s into a 40 s pause | the other replica took the Lease 16.3 s after the kill; promoted, the pause kept | - / 56.1 s |
 
+A third run (41669329436 at `c57b822`, which added the quota test) gave 35.1 s, 16.5 s, 20.6 s and 56.7 s (the Lease
+taken 17.4 s after the kill), and the shares 30.2% and 50.9%. Its new test reproduced the ResourceQuota limitation:
+with a pod quota of `replicas + 2`, 30 s after a rollback from the 50% step the stable had 3 of its 4 pods (its
+ReplicaSet: `exceeded quota: pods, requested: pods=1, used: pods=6, limited: pods=6`), and the rolled-back canary's 2
+ready pods still served 36.4% of the requests ("Limitations").
+
 - **The replica ratio as a traffic split**, from the pods' own request counters over each step's last 10 s: at the
   25% step (1 canary pod of 4) the canary served 27.3% and 21.6% of the requests, at the 50% step (2 of 4) 51.1% and
   52.6%. That holds with one connection per request; with keep-alive connections it wouldn't ("Limitations").
@@ -440,8 +446,11 @@ and on failure prints the rollouts, Deployments, pods, Events, logs and Promethe
 - `AnalysisPassing` shows the last check run, which after a new rollout starts may be the previous rollout's until the
   first check (its message names the step and check number).
 - After a rollback, a deleted stable isn't recreated until the template changes (it would run the failed version).
-- A rolled-back canary keeps all its pods, ready or not, until the stable is back; with a tight ResourceQuota its
-  unready pods could hold the quota the stable needs (not reproduced; DESIGN.md, "Limitations").
+- **A tight ResourceQuota can hold a rollback forever, with the rolled-back version serving.** A rolled-back canary
+  keeps its pods until the stable is back (capacity), and a quota with room for the forward steps may have none for
+  that. Reproduced on kind (`TestATightQuotaHoldsARollbackWithTheCanaryServing`, a pod quota of `replicas + 2`, a
+  rollback from the 50% step): 30 s after the rollback the stable had 3 of 4 pods, and the canary's 2 still served
+  36.4% of the requests (DESIGN.md, "Limitations").
 - Editing the steps or `replicas` mid-pause restarts the step's pause (its pods change).
 - A status write lost at a step advance can make the step run again in two cases: the step's pause was 0s (the one
   decision that passed it is the lost one), or `replicas` went up before the next reconcile (the canary then has

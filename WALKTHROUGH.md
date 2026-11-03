@@ -406,6 +406,14 @@ a check that came due meanwhile runs at once, and the rollout is promoted with o
 Event. That works because the operator keeps no state of its own; everything is in the status and the Deployments.
 The pods keep serving throughout: a dead operator stops decisions, not traffic.
 
+**What did the e2e find that envtest couldn't?** The ResourceQuota limitation. A rolled-back canary keeps its pods
+until the stable is back, so capacity never drops; with a pod quota that fits every forward step (`replicas + 2`), a
+rollback from the 50% step needs two stable pods back while the canary still holds two, the quota refuses one, and the
+rollback never finishes: 30 s later the stable had 3 of 4 pods and the rolled-back version still served 36.4% of the
+requests. The test asserts that hold and fails if it ever ends, so whoever fixes it updates the docs. The fix is a
+trade: shrink the canary a pod at a time when the stable reports a quota failure, one ready pod below `replicas`
+meanwhile. I'd make it the default, since serving a version that failed its analysis is worse than one pod short.
+
 **What isn't covered?** Several nodes, a leader that hangs instead of crashing (it keeps the Lease until its renewals
 fail, 10 seconds by default), and traffic through a mesh or Gateway API.
 

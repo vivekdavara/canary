@@ -480,6 +480,7 @@ Each test gets its own namespace, a Service, a load generator, and a rollout wit
 | `TestAGoodVersionIsPromoted` | fails no requests | Both steps (25%, 50%, 15s pauses) pass and it is promoted. The passing check measured an error rate of 0; the Events include `RolloutStarted`, `StepAdvanced`, `Promoting`, `Promoted`. At each step's end the pods' counters give the canary's actual share of the requests. |
 | `TestABadVersionIsRolledBack` | fails half of them | Rolled back after `failureLimit + 1` failed checks, at least one of which measured an error rate above the max (so the rollback isn't from missing data); the status and Events say so. |
 | `TestAVersionThatNeverBecomesReadyIsRolledBackAtTheDeadline` | never becomes ready | Rolled back by the 20s progress deadline, with no other event to wake the operator, never before it, and no checks run. |
+| `TestATightQuotaHoldsARollbackWithTheCanaryServing` | fails a metric once the canary has two pods | A pod quota of `replicas + 2` fits every forward step but not the rollback from the 50% step: 30s after it the stable is still short (its ReplicaSet refused by the quota) and the rolled-back canary still serves. A limitation reproduced ("Limitations"); the test fails if the rollback ever finishes. |
 | `TestARolloutSurvivesTheLeaderCrashing` | fails no requests | The leader's pod is deleted with no grace period early in a 40s pause. The other replica takes the Lease when it expires, carries the step on from the status (the pause keeps the start the old leader wrote) and promotes, with one of each Event. It runs alone, before the others, so its handover doesn't hold up their rollouts. |
 
 All three then wait until only the surviving revision's pods are left, all ready, and the canary at 0, and fail if
@@ -522,11 +523,15 @@ push (`.github/workflows/ci.yml`, the `e2e` job). Not covered: several nodes, a 
   without `omitempty` would give every unchanged template a new revision, and so start a rollout of everything it
   manages. `TestRevisionIsPinned` pins one template's revision so such an upgrade fails a test instead of shipping;
   the fix then would be to compare templates semantically rather than by hash.
-- **A rolled-back canary keeps all its pods, ready or not, until the stable is back.** In a namespace with a tight
-  ResourceQuota its unready pods (after a deadline rollback) could hold the quota the stable needs to scale up, and
-  the hold would never finish (the review's suspicion, not reproduced: envtest runs no quota controller). Keeping only
-  its ready pods would free the quota, but a Deployment spreads a scale-down over its ReplicaSets, so a canary
-  mid-template-change could lose ready pods.
+- **A rolled-back canary keeps all its pods, ready or not, until the stable is back**, so in a namespace with a tight
+  ResourceQuota the rollback can hold forever with the rolled-back version serving. Day 3's review suspected it;
+  envtest runs no quota controller, kind does: with a pod quota of `replicas + 2` (enough for every forward step), a
+  rollback from the 50% step left the stable at 3 of 4 pods, its ReplicaSet refused by the quota, and the canary's 2
+  ready pods serving 36.4% of the requests 30 s later (`TestATightQuotaHoldsARollbackWithTheCanaryServing`, which
+  fails if the rollback ever finishes, so a fix must update this). A fix has to trade capacity for it: shrinking the
+  canary a pod at a time when the stable reports a quota failure frees room one pod at a time, at one ready pod below
+  `replicas` meanwhile. Keeping only its ready pods wouldn't help here (they are all ready) and a Deployment spreads a
+  scale-down over its ReplicaSets, so a canary mid-template-change could lose ready pods.
 - **Reconciles run one at a time**, and a check runs inside one, so a slow Prometheus holds up other rollouts by up to
   `--analysis-timeout` per check (the metrics of one check are queried in parallel).
 - **The progress deadline runs per step from when the step began waiting**, and edits during the wait (more replicas)
