@@ -112,7 +112,9 @@ type world struct {
 	minReady int32
 }
 
-func newWorld(t *testing.T, name string, replicas int32, steps []v1.Step, deadline int32) *world {
+// newWorld creates the namespace, then first (objects of the test's own, such as a ResourceQuota, put in it), then
+// the Service, the rollout (changed by edit, if given) and the load generator.
+func newWorld(t *testing.T, name string, replicas int32, steps []v1.Step, deadline int32, edit func(*v1.CanaryRollout), first ...client.Object) *world {
 	t.Helper()
 	ctx := context.Background()
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "e2e-" + name + "-"}}
@@ -171,7 +173,13 @@ func newWorld(t *testing.T, name string, replicas int32, steps []v1.Step, deadli
 			},
 		},
 	}
-	for _, obj := range []client.Object{svc, ro, load} {
+	if edit != nil {
+		edit(ro)
+	}
+	for _, obj := range first {
+		obj.SetNamespace(w.ns)
+	}
+	for _, obj := range append(first, svc, ro, load) {
 		if err := k8s.Create(ctx, obj); err != nil {
 			t.Fatal(err)
 		}
@@ -452,7 +460,7 @@ func steps(weights ...int32) []v1.Step {
 func TestAGoodVersionIsPromoted(t *testing.T) {
 	t.Parallel()
 	const replicas = 4
-	w := newWorld(t, "good", replicas, steps(25, 50), 120)
+	w := newWorld(t, "good", replicas, steps(25, 50), 120, nil)
 	old := w.waitStable(replicas)
 	w.watchCapacity()
 
@@ -522,7 +530,7 @@ func TestAGoodVersionIsPromoted(t *testing.T) {
 func TestABadVersionIsRolledBack(t *testing.T) {
 	t.Parallel()
 	const replicas = 4
-	w := newWorld(t, "bad", replicas, []v1.Step{{Weight: 25, Pause: &metav1.Duration{Duration: time.Minute}}, {Weight: 50}}, 120)
+	w := newWorld(t, "bad", replicas, []v1.Step{{Weight: 25, Pause: &metav1.Duration{Duration: time.Minute}}, {Weight: 50}}, 120, nil)
 	old := w.waitStable(replicas)
 	w.watchCapacity()
 
@@ -573,7 +581,7 @@ func TestABadVersionIsRolledBack(t *testing.T) {
 func TestAVersionThatNeverBecomesReadyIsRolledBackAtTheDeadline(t *testing.T) {
 	t.Parallel()
 	const replicas, deadline = 2, 20
-	w := newWorld(t, "hung", replicas, steps(50), deadline)
+	w := newWorld(t, "hung", replicas, steps(50), deadline, nil)
 	old := w.waitStable(replicas)
 	w.watchCapacity()
 
@@ -629,7 +637,7 @@ func TestARolloutSurvivesTheLeaderCrashing(t *testing.T) {
 	w := newWorld(t, "failover", replicas, []v1.Step{
 		{Weight: 25, Pause: &metav1.Duration{Duration: 40 * time.Second}},
 		{Weight: 50, Pause: &metav1.Duration{Duration: 10 * time.Second}},
-	}, 120)
+	}, 120, nil)
 	w.waitStable(replicas)
 	w.watchCapacity()
 
@@ -688,6 +696,84 @@ func TestARolloutSurvivesTheLeaderCrashing(t *testing.T) {
 	}
 	w.result("the new leader took the Lease %.1fs after the old one was killed; promoted %.1fs after the template changed, the first pause kept; fewest ready pods %d of %d",
 		takeover.Seconds(), took.Seconds(), w.fewestReady(), replicas)
+}
+
+// A limitation (README "Limitations"), reproduced: a namespace whose ResourceQuota leaves room for one pod beyond
+// the rollout's and the load generator's. A rollback from the 50% step needs the stable's pods back before the
+// canary's go (capacity), the quota has room for only one of them while the canary's exist, and the rollback never
+// finishes: the rolled-back version keeps serving its share. The metric fails once the canary has two pods, so the
+// rollback comes at the second step.
+func TestATightQuotaHoldsARollbackWithTheCanaryServing(t *testing.T) {
+	t.Parallel()
+	const replicas = 4
+	quota := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: "pods"},
+		Spec: corev1.ResourceQuotaSpec{Hard: corev1.ResourceList{
+			// The rollout's pods, one more (a step's canary pod starts before a stable pod goes), and the load generator.
+			corev1.ResourcePods: *resource.NewQuantity(replicas+2, resource.DecimalSI),
+		}},
+	}
+	w := newWorld(t, "quota", replicas, []v1.Step{
+		{Weight: 25, Pause: &metav1.Duration{Duration: 10 * time.Second}},
+		{Weight: 50, Pause: &metav1.Duration{Duration: time.Hour}},
+	}, 120, func(ro *v1.CanaryRollout) {
+		ro.Spec.Analysis.Metrics = []v1.Metric{{
+			Name:  "canary-pods",
+			Query: fmt.Sprintf(`count(up{namespace=%q,rollout="quota",track="canary"})`, ro.Namespace),
+			Max:   ptr(1.0),
+		}}
+	}, quota)
+	old := w.waitStable(replicas)
+	w.watchCapacity()
+
+	rev := w.setVersion(v2Good)
+	w.waitFor(3*time.Minute, "the rollback at the second step", func(ro *v1.CanaryRollout) bool {
+		if ro.Status.Phase == v1.PhaseHealthy && ro.Status.StableRevision == rev {
+			t.Fatalf("promoted: %s", describe(ro))
+		}
+		return ro.Status.Phase == v1.PhaseRolledBack
+	})
+	rolledBack := time.Now()
+	// Give it 30 seconds to finish, which it can't.
+	time.Sleep(30 * time.Second)
+	held := time.Since(rolledBack)
+	stable, canary := w.deployment("stable"), w.deployment("canary")
+	if stable == nil || canary == nil {
+		t.Fatalf("a Deployment is gone: stable %v, canary %v", stable != nil, canary != nil)
+	}
+	ro := w.get()
+	if ro.Status.Phase != v1.PhaseRolledBack || ro.Status.StableRevision != old {
+		t.Fatalf("after the hold: %s", describe(ro))
+	}
+	if stable.Status.ReadyReplicas >= replicas || canary.Status.ReadyReplicas == 0 {
+		t.Fatalf("the rollback finished under the quota (stable %d ready, canary %d): the limitation is gone; update README",
+			stable.Status.ReadyReplicas, canary.Status.ReadyReplicas)
+	}
+	// The stable's ReplicaSet can't create the pods it is short: the quota refuses them.
+	var sets appsv1.ReplicaSetList
+	if err := k8s.List(context.Background(), &sets, client.InNamespace(w.ns), client.MatchingLabels{controller.LabelRollout: "quota", controller.LabelTrack: "stable"}); err != nil {
+		t.Fatal(err)
+	}
+	why := ""
+	for _, rs := range sets.Items {
+		for _, c := range rs.Status.Conditions {
+			if c.Type == appsv1.ReplicaSetReplicaFailure && c.Status == corev1.ConditionTrue {
+				why = c.Message
+			}
+		}
+	}
+	if !strings.Contains(why, "exceeded quota") {
+		t.Errorf("the stable's ReplicaSets show no quota failure: %q", why)
+	}
+	share, err := w.canaryShare()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fewest := w.fewestReady(); fewest < replicas {
+		t.Errorf("the ready pods went down to %d of %d", fewest, replicas)
+	}
+	w.result("%.0fs after the rollback: stable %d of %d ready, the rolled-back canary still at %d ready pods serving %.1f%% of the requests; the stable's ReplicaSet: %.120s",
+		held.Seconds(), stable.Status.ReadyReplicas, replicas, canary.Status.ReadyReplicas, 100*share, why)
 }
 
 // The analysis client (internal/analysis/prometheus.go) against a real Prometheus: the unit tests use canned
