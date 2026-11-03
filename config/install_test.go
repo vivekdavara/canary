@@ -107,3 +107,19 @@ func TestTheOperatorsManifestsApply(t *testing.T) {
 		t.Errorf("the operator's Deployment: %s\nwant %s", stdout, want)
 	}
 }
+
+// The end-to-end tests' overlay (test/e2e/config: the operator pointed at a Prometheus of their own) is accepted by
+// the API server as it stands; test/e2e runs it on kind. (A server-side dry run can't check it: it creates no
+// namespace, so everything in one is refused.)
+func TestTheEndToEndOverlayApplies(t *testing.T) {
+	env := testenv.Get(t)
+	stdout, stderr, err := env.Kubectl("apply", "--server-side", "-k", "../test/e2e/config")
+	if err != nil {
+		t.Fatalf("kubectl apply --server-side -k ../test/e2e/config: %v: %s", err, stderr)
+	}
+	for _, obj := range []string{"namespace/canary-e2e", "configmap/prometheus", "deployment.apps/prometheus", "service/prometheus", "deployment.apps/canary"} {
+		if !strings.Contains(stdout, obj+" serverside-applied") {
+			t.Errorf("the dry run didn't apply %s:\n%s", obj, stdout)
+		}
+	}
+}
