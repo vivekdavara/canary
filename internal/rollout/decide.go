@@ -196,13 +196,16 @@ func decide(in Input) Plan {
 	//
 	// The status can't show a rollback decided by a failed check whose status write was lost: only that the check is
 	// due again. So a due check runs first (the two calls of the normal path), and decides (the review's second round).
+	// Not when the status already says the rollout failed (a lowered limit: the normal path rolls back without a
+	// check), and not for a pause the normal path would restart (pauseCurrent; the fourth round found both).
 	if stable == nil {
 		failedChecks := last.Analysis.FailedChecks
 		analysisAfter := last.Analysis // with the check this decision ran, if any
 		var checked *CheckResult
 		var events []Event
-		if a := in.Spec.Analysis; a != nil && last.Phase == v1.PhaseProgressing && last.CanaryRevision == rev &&
-			last.StepStartedAt != nil && canary != nil && canary.Revision == rev {
+		_, failed := alreadyFailed(in, failedChecks)
+		if a := in.Spec.Analysis; a != nil && !failed && last.Phase == v1.PhaseProgressing && last.CanaryRevision == rev &&
+			pauseCurrent(in) {
 			i := stepIndex(last.CurrentStep, in.Spec)
 			next := last.StepStartedAt.Add(intervalOf(a))
 			if last.Analysis.LastCheckAt != nil {
@@ -619,7 +622,7 @@ func alreadyFailed(in Input, failedChecks int32) (string, bool) {
 		return "", false
 	}
 	i := stepIndex(last.CurrentStep, in.Spec)
-	if a := in.Spec.Analysis; a != nil && last.StepStartedAt != nil && failedChecks > failureLimitOf(a) {
+	if a := in.Spec.Analysis; a != nil && pauseCurrent(in) && failedChecks > failureLimitOf(a) {
 		return fmt.Sprintf("%d of %s's checks failed, more than the %d allowed", failedChecks, stepName(in.Spec, i), failureLimitOf(a)), true
 	}
 	c, _ := Split(in.Spec.Replicas, in.Spec.Steps[i].Weight)
@@ -628,6 +631,19 @@ func alreadyFailed(in Input, failedChecks int32) (string, bool) {
 		return fmt.Sprintf("%s wasn't ready within the progress deadline of %v", stepName(in.Spec, i), progressDeadlineOf(in.Spec)), true
 	}
 	return "", false
+}
+
+// pauseCurrent says the status's pause still belongs to the canary's pods, by the rule the normal path restarts a
+// pause with ("A pause belongs to the pods it started with" in decide): the canary runs the template's revision and is
+// set to the step's count, or to more once the pause is over. Its checks and failures count only then.
+func pauseCurrent(in Input) bool {
+	last, canary := in.Status, in.Canary
+	if last.StepStartedAt == nil || canary == nil || canary.Revision != in.Revision {
+		return false
+	}
+	i := stepIndex(last.CurrentStep, in.Spec)
+	c, _ := Split(in.Spec.Replicas, in.Spec.Steps[i].Weight)
+	return canary.Replicas == c || (pauseOver(last.StepStartedAt, in.Spec.Steps[i], in.Now) && canary.Replicas > c)
 }
 
 // sameTime says a and b are both nil or the same instant.
