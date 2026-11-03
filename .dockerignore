@@ -1,0 +1,3 @@
+# The build context is only the Linux binaries make images builds.
+*
+!bin/linux/

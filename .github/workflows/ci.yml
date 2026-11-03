@@ -31,3 +31,34 @@ jobs:
           test -z "$(git status --porcelain)"
       - name: Build
         run: make build
+
+  e2e:
+    # The end-to-end tests on kind (test/e2e; DESIGN.md, "End to end"): the operator from its image, a real Deployment
+    # controller and a real Prometheus. kind and its node image are pinned (the Makefile has the node image's digest).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Tools and envtest binaries cache
+        # setup-envtest's kubectl is the one make e2e-install uses.
+        uses: actions/cache@v6
+        with:
+          path: bin
+          key: tools-${{ runner.os }}-${{ hashFiles('Makefile') }}
+      - name: kind
+        run: |
+          curl -fsSLo kind https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          echo "aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  kind" | sha256sum -c -
+          sudo install kind /usr/local/bin/kind
+      - name: Cluster
+        run: make e2e-cluster
+      - name: Images, operator and Prometheus
+        run: make e2e-install
+      - name: End-to-end tests
+        run: make e2e-test
+      - name: Diagnostics
+        if: failure()
+        run: make e2e-diagnose

@@ -1,4 +1,4 @@
-.PHONY: build check envtest generate lint manifests test tools
+.PHONY: build check e2e e2e-cluster e2e-diagnose e2e-down e2e-install e2e-test envtest generate images lint manifests test tools
 
 # Tools, pinned and installed into bin/ (gitignored), so a check never depends on what else is on the machine.
 CONTROLLER_TOOLS_VERSION ?= v0.21.0
@@ -55,3 +55,41 @@ test: $(SETUP_ENVTEST)
 
 build:
 	go build -o bin/ ./cmd/...
+
+# The images: the operator (canary:dev) and the end-to-end tests' demo app (canary-demoapp:dev), each a static Linux
+# binary for this machine's architecture copied onto distroless (Dockerfile).
+images:
+	CGO_ENABLED=0 GOOS=linux go build -trimpath -o bin/linux/ ./cmd/canary ./test/e2e/demoapp
+	docker build --build-arg BINARY=canary -t canary:dev .
+	docker build --build-arg BINARY=demoapp -t canary-demoapp:dev .
+
+# The end-to-end tests (test/e2e; DESIGN.md, "End to end") on a kind cluster: make e2e creates the cluster, builds and
+# loads the images, installs the operator and a Prometheus, and runs the tests; make e2e-down deletes the cluster. CI
+# runs them on every push. They need Docker and kind.
+KIND ?= kind
+KIND_CLUSTER ?= canary-e2e
+# kind v0.33.0's node image for Kubernetes 1.37.0, the version envtest runs.
+KIND_NODE_IMAGE ?= kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+# envtest's kubectl (the one the install tests use), against the kind cluster.
+KUBECTL = $(shell $(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(BIN)/k8s -p path)/kubectl --context kind-$(KIND_CLUSTER)
+
+e2e: e2e-cluster e2e-install e2e-test
+
+e2e-cluster:
+	$(KIND) create cluster --name $(KIND_CLUSTER) --image $(KIND_NODE_IMAGE) --config test/e2e/kind.yaml --wait 2m
+
+e2e-install: images $(SETUP_ENVTEST)
+	$(KIND) load docker-image --name $(KIND_CLUSTER) canary:dev canary-demoapp:dev
+	$(KUBECTL) apply --server-side -k test/e2e/config
+	$(KUBECTL) -n canary-system rollout status deployment/canary --timeout 2m
+	$(KUBECTL) -n canary-e2e rollout status deployment/prometheus --timeout 2m
+
+e2e-test:
+	go test -tags e2e -count=1 -v -timeout 15m ./test/e2e/
+
+# What CI prints when the end-to-end tests fail.
+e2e-diagnose: $(SETUP_ENVTEST)
+	KUBECTL="$(KUBECTL)" test/e2e/diagnose.sh
+
+e2e-down:
+	$(KIND) delete cluster --name $(KIND_CLUSTER)
