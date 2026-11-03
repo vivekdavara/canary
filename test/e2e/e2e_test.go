@@ -20,6 +20,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	eventsv1 "k8s.io/api/events/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -605,6 +606,88 @@ func TestAVersionThatNeverBecomesReadyIsRolledBackAtTheDeadline(t *testing.T) {
 		t.Errorf("the ready pods went down to %d of %d", fewest, replicas)
 	}
 	w.result("rolled back %.1fs after the template changed (deadline %ds); fewest ready pods %d of %d", took.Seconds(), deadline, w.fewestReady(), replicas)
+}
+
+// leaderPod is the pod holding the operator's Lease: its holder identity is the pod's name (the hostname), "_" and a
+// UUID (controller-runtime's leader election).
+func leaderPod(t *testing.T) string {
+	t.Helper()
+	var lease coordinationv1.Lease
+	err := k8s.Get(context.Background(), client.ObjectKey{Namespace: "canary-system", Name: "canary.rollouts.vivekdavara.github.io"}, &lease)
+	if err != nil || lease.Spec.HolderIdentity == nil {
+		return ""
+	}
+	pod, _, _ := strings.Cut(*lease.Spec.HolderIdentity, "_")
+	return pod
+}
+
+// The leader crashes mid-step (its pod deleted with no grace period): the other replica takes the Lease when it
+// expires, carries the step on from the status (the pause isn't restarted) and promotes, and the ready pods never go
+// below replicas. Not parallel, so the handover doesn't hold up the other tests' rollouts and timings.
+func TestARolloutSurvivesTheLeaderCrashing(t *testing.T) {
+	const replicas = 4
+	w := newWorld(t, "failover", replicas, []v1.Step{
+		{Weight: 25, Pause: &metav1.Duration{Duration: 40 * time.Second}},
+		{Weight: 50, Pause: &metav1.Duration{Duration: 10 * time.Second}},
+	}, 120)
+	w.waitStable(replicas)
+	w.watchCapacity()
+
+	changed := time.Now()
+	rev := w.setVersion(v2Good)
+	paused := w.waitFor(time.Minute, "the first step's pause", func(ro *v1.CanaryRollout) bool {
+		c := meta.FindStatusCondition(ro.Status.Conditions, controller.ConditionProgressing)
+		return ro.Status.StepStartedAt != nil && c != nil && c.Reason == rollout.ReasonStepPaused
+	})
+	started := paused.Status.StepStartedAt.Time
+	leader := leaderPod(t)
+	if leader == "" {
+		t.Fatal("no operator holds the Lease")
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "canary-system", Name: leader}}
+	if err := k8s.Delete(context.Background(), pod, client.GracePeriodSeconds(0)); err != nil {
+		t.Fatal(err)
+	}
+	killed := time.Now()
+	t.Logf("+%5.1fs killed the leader, %s", time.Since(w.start).Seconds(), leader)
+	var next string
+	for next = leaderPod(t); next == "" || next == leader; next = leaderPod(t) {
+		if time.Since(killed) > time.Minute {
+			t.Fatal("no new leader a minute after the old one was killed")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	takeover := time.Since(killed)
+	t.Logf("+%5.1fs %s took the Lease", time.Since(w.start).Seconds(), next)
+
+	final := w.waitFor(3*time.Minute, "the promotion", func(ro *v1.CanaryRollout) bool {
+		s := ro.Status
+		if s.Phase == v1.PhaseRolledBack {
+			t.Fatalf("rolled back: %s", describe(ro))
+		}
+		// While the first step runs, its pause is the one the old leader started.
+		if s.CurrentStep != nil && *s.CurrentStep == 0 && s.StepStartedAt != nil && !s.StepStartedAt.Time.Equal(started) {
+			t.Fatalf("the new leader restarted the pause: it started at %v, now %v", started, s.StepStartedAt.Time)
+		}
+		return s.Phase == v1.PhaseHealthy && s.StableRevision == rev
+	})
+	took := time.Since(changed)
+	w.waitSettled(rev, replicas)
+
+	reasons, notes := w.events()
+	for reason, want := range map[string]int{rollout.EventRolloutStarted: 1, rollout.EventPromoting: 1, rollout.EventPromoted: 1, rollout.EventRolledBack: 0} {
+		if reasons[reason] != want {
+			t.Errorf("%d %s Events, want %d; all: %q", reasons[reason], reason, want, notes)
+		}
+	}
+	if fewest := w.fewestReady(); fewest < replicas {
+		t.Errorf("the ready pods went down to %d of %d", fewest, replicas)
+	}
+	if final.Status.StableRevision != rev {
+		t.Errorf("stable revision %q, want %q", final.Status.StableRevision, rev)
+	}
+	w.result("the new leader took the Lease %.1fs after the old one was killed; promoted %.1fs after the template changed, the first pause kept; fewest ready pods %d of %d",
+		takeover.Seconds(), took.Seconds(), w.fewestReady(), replicas)
 }
 
 // The analysis client (internal/analysis/prometheus.go) against a real Prometheus: the unit tests use canned
