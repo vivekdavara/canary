@@ -463,10 +463,15 @@ func TestAGoodVersionIsPromoted(t *testing.T) {
 	// At each step's end, the canary's share of the requests over the step's last 10 seconds.
 	var shares []string
 	step := int32(-1)
+	// The most failed checks seen in a step (a promotion clears the counts).
+	var mostFailed int32
 	final := w.waitFor(4*time.Minute, "the promotion", func(ro *v1.CanaryRollout) bool {
 		s := ro.Status
 		if s.Phase == v1.PhaseRolledBack {
 			t.Fatalf("rolled back: %s", describe(ro))
+		}
+		if s.Analysis != nil && s.Analysis.FailedChecks > mostFailed {
+			mostFailed = s.Analysis.FailedChecks
 		}
 		at := int32(-1)
 		if s.CurrentStep != nil {
@@ -507,8 +512,8 @@ func TestAGoodVersionIsPromoted(t *testing.T) {
 	if fewest := w.fewestReady(); fewest < replicas {
 		t.Errorf("the ready pods went down to %d of %d during the rollout", fewest, replicas)
 	}
-	w.result("promoted %.1fs after the template changed; fewest ready pods %d of %d; %d failed checks tolerated in the last step; %s",
-		took.Seconds(), w.fewestReady(), replicas, final.Status.Analysis.FailedChecks, strings.Join(shares, "; "))
+	w.result("promoted %.1fs after the template changed; fewest ready pods %d of %d; at most %d failed checks tolerated in a step; %s",
+		took.Seconds(), w.fewestReady(), replicas, mostFailed, strings.Join(shares, "; "))
 }
 
 // A version that fails half its requests fails its checks on measured error rates (not on missing data) and is
@@ -606,21 +611,24 @@ func TestAVersionThatNeverBecomesReadyIsRolledBackAtTheDeadline(t *testing.T) {
 // answers, written from the API's documentation; these are the answers Prometheus actually gives.
 func TestThePrometheusClientAgainstPrometheus(t *testing.T) {
 	ctx := context.Background()
-	// The operator's own metrics are scraped like any pod's: wait for three scrapes of them, for the queries over
-	// real series (a rate needs two).
+	// Prometheus scrapes the operator's two pods like any others; its own up series of them (1 per scrape, one series
+	// per pod) are real series to query. Wait for three scrapes of each (a rate needs two).
+	const up = `up{namespace="canary-system"}`
 	deadline := time.Now().Add(time.Minute)
 	for {
-		r, err := prom.Query(ctx, `min(count_over_time(workqueue_depth{namespace="canary-system"}[1m]))`)
+		r, err := prom.Query(ctx, `min(count_over_time(`+up+`[1m]))`)
 		if err == nil && len(r.Values) == 1 && r.Values[0] >= 3 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("Prometheus has no series of the operator after a minute: %+v, %v", r, err)
+			t.Fatalf("Prometheus hasn't scraped the operator three times in a minute: %+v, %v", r, err)
 		}
 		time.Sleep(time.Second)
 	}
-	max := 1.0
-	m := v1.Metric{Name: "m", Max: &max}
+	if r, err := prom.Query(ctx, `count(count by (__name__) ({namespace="canary-system"}))`); err == nil && len(r.Values) == 1 {
+		t.Logf("the operator's pods export %g metric names", r.Values[0])
+	}
+	m := v1.Metric{Name: "m", Max: ptr(1.0)}
 	for _, c := range []struct {
 		query string
 		typ   string
@@ -637,12 +645,13 @@ func TestThePrometheusClientAgainstPrometheus(t *testing.T) {
 		{query: `vector(4.9e-324)`, typ: "vector", why: "max 1"},
 		{query: `no_such_metric_anywhere`, typ: "vector", why: "the query returned no samples"},
 		{query: `vector(1) or label_replace(vector(2), "x", "y", "", "")`, typ: "vector", why: "the query returned 2 samples, not one"},
-		{query: `workqueue_depth{namespace="canary-system"}[1m]`, typ: "matrix", why: "the query returned a matrix, not one number"},
+		{query: up, typ: "vector", why: "the query returned 2 samples, not one"},
+		{query: up + `[1m]`, typ: "matrix", why: "the query returned a matrix, not one number"},
 		{query: `"text"`, typ: "string", why: "the query returned a string, not one number"},
 		// An info annotation (a rate over a gauge) says nothing about the data and passes.
-		{query: `sum(rate(workqueue_depth{namespace="canary-system"}[1m])) * 0`, typ: "vector", why: "max 1"},
+		{query: `sum(rate(` + up + `[1m])) * 0`, typ: "vector", why: "max 1"},
 		// A warning means the answer may be wrong or partial: here, buckets with no le label.
-		{query: `histogram_quantile(0.9, workqueue_depth{namespace="canary-system"})`, err: "Prometheus answered with a warning"},
+		{query: `histogram_quantile(0.9, ` + up + `)`, err: "Prometheus answered with a warning"},
 		{query: `sum(`, err: "Prometheus: bad_data: "},
 	} {
 		r, err := prom.Query(ctx, c.query)
