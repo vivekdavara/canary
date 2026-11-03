@@ -1,0 +1,6 @@
+# Everything the operator needs in a cluster: kubectl apply --server-side -k config/default (the CRD is too big for
+# a client-side apply; README, "Run it").
+resources:
+  - ../crd
+  - ../rbac
+  - ../manager

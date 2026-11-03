@@ -1,10 +1,12 @@
 # What the operator needs with --leader-elect, in the namespace holding the lock (--leader-election-namespace, or
 # the operator's own when it runs in the cluster): the Lease it holds and renews, and the Events it records on taking
-# it. Written by hand: controller-gen's rbac markers make the cluster-wide role.yaml.
+# it. Written by hand: controller-gen's rbac markers make the cluster-wide role.yaml. The namespace is the one
+# config/manager runs the operator in; the tests bind it in namespaces of their own.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: canary-leader-election
+  namespace: canary-system
 rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]

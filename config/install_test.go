@@ -52,3 +52,58 @@ func TestTheSampleAppliesWithKubectl(t *testing.T) {
 		t.Errorf("kubectl get crl header %q; want %q", header, want)
 	}
 }
+
+// README, "Run it": config/default installs the CRD, the operator's service account with its permissions, and the
+// operator itself, with one server-side apply. envtest runs no pods, so this checks the manifests the API server
+// accepts and the permissions they grant; test/e2e runs them on kind.
+func TestTheOperatorsManifestsApply(t *testing.T) {
+	env := testenv.Get(t)
+	stdout, stderr, err := env.Kubectl("apply", "--server-side", "-k", "default")
+	if err != nil {
+		t.Fatalf("kubectl apply --server-side -k default: %v: %s", err, stderr)
+	}
+	for _, obj := range []string{
+		"namespace/canary-system", "customresourcedefinition.apiextensions.k8s.io/canaryrollouts.rollouts.vivekdavara.github.io",
+		"serviceaccount/canary", "role.rbac.authorization.k8s.io/canary-leader-election",
+		"clusterrole.rbac.authorization.k8s.io/canary-manager", "rolebinding.rbac.authorization.k8s.io/canary-leader-election",
+		"clusterrolebinding.rbac.authorization.k8s.io/canary-manager", "deployment.apps/canary",
+	} {
+		if !strings.Contains(stdout, obj+" serverside-applied") {
+			t.Errorf("kubectl apply didn't apply %s:\n%s", obj, stdout)
+		}
+	}
+
+	// The service account holds the generated ClusterRole everywhere and the Lease's Role only in its own
+	// namespace; nothing else.
+	as := "--as=system:serviceaccount:canary-system:canary"
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"watch", "canaryrollouts.rollouts.vivekdavara.github.io", "-A"}, "yes"},
+		{[]string{"patch", "canaryrollouts.rollouts.vivekdavara.github.io", "--subresource=status", "-n", "default"}, "yes"},
+		{[]string{"update", "canaryrollouts.rollouts.vivekdavara.github.io", "-n", "default"}, "no"},
+		{[]string{"create", "deployments.apps", "-n", "default"}, "yes"},
+		{[]string{"delete", "deployments.apps", "-n", "default"}, "no"},
+		{[]string{"update", "leases.coordination.k8s.io", "-n", "canary-system"}, "yes"},
+		{[]string{"update", "leases.coordination.k8s.io", "-n", "default"}, "no"},
+		{[]string{"get", "secrets", "-n", "canary-system"}, "no"},
+		{[]string{"create", "pods", "-n", "default"}, "no"},
+	} {
+		stdout, stderr, err := env.Kubectl(append([]string{"auth", "can-i", as}, c.args...)...)
+		// can-i exits 1 for "no", so the answer is the output, not the error.
+		if got := strings.TrimSpace(stdout); got != c.want {
+			t.Errorf("can-i %s: %q (%v, %s), want %q", strings.Join(c.args, " "), got, err, stderr, c.want)
+		}
+	}
+
+	// The Deployment runs the operator as that account, with leader election, both ports and the probes.
+	stdout, stderr, err = env.Kubectl("get", "deployment", "canary", "-n", "canary-system", "-o",
+		"jsonpath={.spec.template.spec.serviceAccountName} {.spec.template.spec.containers[0].args} {.spec.template.spec.containers[0].readinessProbe.httpGet.port}")
+	if err != nil {
+		t.Fatalf("kubectl get deployment: %v: %s", err, stderr)
+	}
+	if want := `canary ["--leader-elect","--metrics-bind-address=:8111","--health-probe-bind-address=:8121"] probes`; stdout != want {
+		t.Errorf("the operator's Deployment: %s\nwant %s", stdout, want)
+	}
+}

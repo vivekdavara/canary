@@ -1,0 +1,2 @@
+resources:
+  - bases/rollouts.vivekdavara.github.io_canaryrollouts.yaml

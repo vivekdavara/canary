@@ -1,0 +1,64 @@
+# The operator in its own namespace. Two replicas with leader election: one reconciles, the other takes over within
+# the Lease's 15 seconds if it goes. The image is the one make images builds (canary:dev); a registry image goes in a
+# kustomize overlay (images:). Without --prometheus-url every check fails (README, "Run it"): an overlay adds it, as
+# test/e2e/config does.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: canary-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: canary
+  namespace: canary-system
+  labels:
+    app.kubernetes.io/name: canary
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: canary
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: canary
+    spec:
+      serviceAccountName: canary
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: canary
+          image: canary:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - --leader-elect
+            - --metrics-bind-address=:8111
+            - --health-probe-bind-address=:8121
+          ports:
+            - name: metrics
+              containerPort: 8111
+            - name: probes
+              containerPort: 8121
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: probes
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: probes
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      terminationGracePeriodSeconds: 30

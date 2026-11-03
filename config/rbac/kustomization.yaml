@@ -1,0 +1,6 @@
+# role.yaml is generated (make manifests); the rest are written by hand.
+resources:
+  - role.yaml
+  - leader_election_role.yaml
+  - service_account.yaml
+  - bindings.yaml

@@ -1,0 +1,28 @@
+# The operator's service account gets the generated ClusterRole (role.yaml) cluster-wide, since rollouts can be in
+# any namespace, and the leader-election Role (leader_election_role.yaml) in its own namespace, where its Lease is.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: canary-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: canary-manager
+subjects:
+  - kind: ServiceAccount
+    name: canary
+    namespace: canary-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: canary-leader-election
+  namespace: canary-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: canary-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: canary
+    namespace: canary-system
