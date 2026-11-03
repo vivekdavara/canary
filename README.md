@@ -4,14 +4,17 @@ A Kubernetes operator for canary rollouts. A `CanaryRollout` holds a pod templat
 operator runs the new version beside the old one in steps (10% of the pods, then 50%, ...), checks Prometheus metrics
 against thresholds at each step, and either promotes the new version or rolls it back.
 
-Status: **day 3 of 5**: the operator runs rollouts and decides them. On a template change it starts the new version
-in a canary Deployment beside the stable one, moves pods to it step by step (each step's pause running once its pods
-are ready), checks Prometheus metrics during each pause, and promotes the new version after the last step or rolls it
-back (a failed analysis, or a step whose pods aren't ready by the progress deadline), without ever dropping below
-`replicas` ready pods. A run on a real cluster (kind, in CI) is day 4's. [DESIGN.md](DESIGN.md) is the specification;
+Status: **day 4 of 5**: the operator runs rollouts and decides them, and runs on a real cluster. On a template change
+it starts the new version in a canary Deployment beside the stable one, moves pods to it step by step (each step's
+pause running once its pods are ready), checks Prometheus metrics during each pause, and promotes the new version
+after the last step or rolls it back (a failed analysis, or a step whose pods aren't ready by the progress deadline),
+without ever dropping below `replicas` ready pods. CI runs it on kind from its image, with a real Deployment
+controller and a real Prometheus measuring a demo app's real errors: one version promoted, one rolled back by its
+analysis, one by the deadline ("Results (day 4)"). [DESIGN.md](DESIGN.md) is the specification;
 [WALKTHROUGH.md](WALKTHROUGH.md) has the questions an interviewer is likely to ask.
 
-Go 1.27, controller-runtime v0.25, Kubernetes 1.37 (envtest locally, kind in CI from day 4). MIT licensed.
+Go 1.27, controller-runtime v0.25, Kubernetes 1.37 (envtest locally, kind v0.33 in CI), Prometheus 3.15 in the e2e. MIT
+licensed.
 
 ## Why
 
@@ -80,6 +83,9 @@ The full example is [config/samples/web.yaml](config/samples/web.yaml) (a test a
 | `config/crd/bases/` | the CRD, generated from the types (`make manifests`) |
 | `config/rbac/role.yaml` | the operator's ClusterRole, generated from the reconciler's rbac markers |
 | `config/rbac/leader_election_role.yaml` | the Role for `--leader-elect`, in the Lease's namespace (written by hand) |
+| `config/rbac/service_account.yaml`, `bindings.yaml` | the operator's service account in `canary-system`, bound to both roles |
+| `config/manager/` | the operator's Deployment (two replicas, leader election, non-root, read-only root filesystem) |
+| `config/default/` | the kustomization installing all of it: `kubectl apply --server-side -k config/default` |
 | `config/samples/` | example rollouts |
 | `internal/revision/` | a template's revision: 16 hex digits of the SHA-256 of its JSON |
 | `internal/rollout/` | the pod split and the state machine (`Decide`: steps, pauses, checks, the deadline, rollback), pure functions |
@@ -87,6 +93,9 @@ The full example is [config/samples/web.yaml](config/samples/web.yaml) (a test a
 | `internal/controller/` | the reconciler: reads, `Decide`, writes the Deployments, the status and the Events |
 | `internal/testenv/` | starts envtest (a real kube-apiserver and etcd) for a package's tests |
 | `cmd/canary/` | the operator's binary |
+| `Dockerfile` | an image of one of the binaries (the operator, or the demo app), on distroless static |
+| `test/e2e/` | the end-to-end tests on kind (build tag `e2e`), the kind config, the overlay adding a Prometheus, the CI diagnostics |
+| `test/e2e/demoapp/` | the application the e2e tests roll out: fails a configured share of requests, counts them for Prometheus; and a load generator |
 
 ## Run it
 
@@ -99,7 +108,17 @@ kube-apiserver and etcd for Kubernetes 1.37.0), regenerates the deep copies, CRD
 vet and every test. A plain `go test ./...` skips the envtest suites; `make test` makes them fail instead if their
 binaries are missing.
 
-Against a cluster (kind, minikube, or any cluster your kubeconfig points at):
+Against a cluster (kind, minikube, or any cluster your kubeconfig points at), either run the operator in the
+cluster from its image (`make images` builds `canary:dev`; load it into kind with `kind load docker-image canary:dev`,
+or push it to a registry and set it in an overlay):
+
+```bash
+kubectl apply --server-side -k config/default
+```
+
+That installs the CRD, the `canary` service account in `canary-system` with the generated ClusterRole and the
+leader-election Role, and the operator (two replicas, leader election). Add `--prometheus-url` to its arguments with
+an overlay, as `test/e2e/config` does. Or install only the CRD and run the operator from here:
 
 ```bash
 kubectl apply --server-side -f config/crd/bases
@@ -149,7 +168,9 @@ play its part: they write a Deployment's status (`markReady`) when its pods woul
 | `internal/controller/reconcile_test.go` | `Reconcile` called by hand through an interceptor client: a status computed from a spec that changed before the patch is refused (the optimistic lock); a reconcile with nothing new writes nothing; a second operator (fixed clocks, ten minutes apart) keeps a paused step's start time |
 | `internal/controller/canaryrollout_controller_test.go` | status follows the spec through template and replica changes; fields the reconciler doesn't own are kept; a missing rollout is no error |
 | `cmd/canary/main_test.go` | the binary from its flags and a kubeconfig: probes answer, a rollout is reconciled, the reconcile is counted in its metrics, a clean stop; with `--leader-elect` it takes the Lease using only the leader-election Role; `--help`; bad `--prometheus-url` and `--analysis-timeout` values refused with the flag named |
-| `config/install_test.go` | the README's install steps with envtest's kubectl: client-side apply of the CRD fails ("Too long"), `--server-side` works, the sample applies, `kubectl get crl` shows the columns |
+| `config/install_test.go` | the README's install steps with envtest's kubectl: client-side apply of the CRD fails ("Too long"), `--server-side` works, the sample applies, `kubectl get crl` shows the columns; `config/default` applies, and `kubectl auth can-i` as its service account shows what it may do and what not (delete Deployments, read Secrets, take a Lease outside `canary-system`); the e2e overlay applies |
+| `test/e2e/demoapp/main_test.go` (unit) | the demo app: the failure schedule (any n consecutive requests fail floor or ceil of n * ratio), the exposition (both codes from the start), the probes, the config refusing bad values, a clean stop, the load generator's rate and one connection per request |
+| `test/e2e/e2e_test.go` (kind, CI) | DESIGN "End to end": a good version promoted, a bad one rolled back on measured error rates, one that never becomes ready rolled back at the deadline, one promoted across the leader's pod being killed mid-pause (the pause kept), capacity sampled every 100 ms throughout; the Prometheus client against a real Prometheus |
 
 Checks that the tests can fail, each run as a mutant. Day 3: letting a step held for its first check scale an
 oversized canary down fails `TestRandomWalksWithAnalysis` and `TestAStepHeldForItsCheckKeepsTheCanaryWhileTheStableIsShort`;
@@ -162,6 +183,37 @@ optimistic lock fails `TestAStatusFromAnOlderSpecIsNotWritten`; dropping either 
 Deployments fails `TestSomeoneElsesDeploymentWithTheName`. From day 1: removing the Deployments rule
 from `config/rbac/role.yaml` fails `TestStatusFollowsTheSpec`; removing the Lease rule fails `TestRunElectsALeader`;
 misspelling `failureLimit` in the sample fails `TestSamplesAreAccepted`.
+
+## Results (day 4)
+
+The end-to-end tests on kind in GitHub Actions (ubuntu-24.04, kind v0.33.0, Kubernetes 1.37.0, Prometheus 3.15.1),
+from the `RESULT` lines of the `e2e` job's log (`gh api repos/vivekdavara/canary/actions/jobs/<job>/logs`) in CI runs
+41665332928 (at `6302a1f`) and 41666193349 (at `9c9ab68`, which added the leader crash). Each rollout has 4 pods (the
+deadline's 2), a load generator at 40 requests a second, and checks every 5 s of the canary's error rate over 20 s,
+two failures allowed:
+
+| Rollout | Outcome | From the template change, run 1 / run 2 |
+|---|---|---|
+| fails no requests; steps 25% and 50%, 15 s pauses | promoted; 0 and 1 failed checks tolerated | 34.3 s / 35.0 s |
+| fails half its requests | rolled back after 3 failed checks; 3 and 2 of them measured an error rate of about 0.5 (the others had no samples yet) | 17.0 s / 16.5 s |
+| never becomes ready; deadline 20 s | rolled back at the deadline, no checks | 20.3 s / 20.6 s |
+| fails no requests; the leader's pod killed 2.6 s into a 40 s pause | the other replica took the Lease 16.3 s after the kill; promoted, the pause kept | - / 56.1 s |
+
+- **The replica ratio as a traffic split**, from the pods' own request counters over each step's last 10 s: at the
+  25% step (1 canary pod of 4) the canary served 27.3% and 21.6% of the requests, at the 50% step (2 of 4) 51.1% and
+  52.6%. That holds with one connection per request; with keep-alive connections it wouldn't ("Limitations").
+- **Capacity**: the two Deployments' ready pods, sampled every 100 ms from the first version up to the end, never went
+  below `replicas` in any rollout of either run (the leader crash included).
+- **The failure limit is used**: in run 2 the good version's first check, 5 s into the pause, failed before Prometheus
+  had two scrapes of the new pod (fail closed), and the next ones passed.
+- **The Prometheus client against Prometheus 3.15.1**: all 15 answers as the unit tests' canned ones assumed (NaN and
+  both infinities as strings, a matrix for a range, `bad_data` for a parse error, an info annotation ignored, a
+  warning refused).
+- The `e2e` job took 3 min 26 s and 4 min 21 s; the tests 37.3 s and 98.2 s (the leader crash runs alone first, then
+  the other three in parallel). The first run (41664098318, before the two fixes in `6302a1f`) gave 16.0 s for the
+  rollback and 20.6 s for the deadline.
+- Locally (no Docker here) `make check` covers the manifests: `config/default` and the e2e overlay applied to envtest,
+  and the service account's permissions checked with `kubectl auth can-i`.
 
 ## Results (day 3)
 
@@ -319,6 +371,22 @@ gone. Each has a test now and each mutant fails it (`2aa772f`); without the cut,
 it is lost. Its unreproduced suspicion, that a rolled-back canary's unready pods could hold a namespace's quota, is
 under limitations.
 
+## Review of day 4 (round 4 of day 3's fixes)
+
+One agent on `b6b6df8`, round 3's fixes, which nobody had reviewed (about 14 minutes, its own worktree, findings as
+tests). No capacity drop, loop or lost instant on a normal path; two low-severity disagreements between the
+stable-gone branch of `Decide` and the normal path, fixed in `089f0b4`:
+
+- A `failureLimit` lowered below the failures so far, with a check due and the stable gone: the branch ran and counted
+  a check the normal path doesn't (2 checks and 2 failures instead of 1 and 1, an extra `AnalysisFailed`).
+- A pause the normal path would restart (`replicas` raised mid-pause) with the stable gone: the branch still checked
+  the old pause, added its failure and rolled back, where the normal path clears it.
+
+Removing half of the second fix survived its test, so a third test covers that half. Three survivors of the repair's
+tests (the refused-rewrite fallback, falling back on any error, upper-casing in the early check) each have a test now
+(`7d8096a`). Each test fails before its fix or on its mutant; I re-ran them all here. Not tested, by the agent's
+reading: a status-write conflict right after the stable is recreated loses that check's Event and condition for good.
+
 ## What went wrong on day 3
 
 Found by my own tests and reading, before the review:
@@ -338,8 +406,10 @@ Found by my own tests and reading, before the review:
 
 ## CI
 
-`.github/workflows/ci.yml`: `make check` on Ubuntu, then a check that the generated files were committed, then the
-build.
+`.github/workflows/ci.yml`, two jobs on every push: `test` runs `make check` on Ubuntu, then a check that the generated
+files were committed, then the build; `e2e` installs kind v0.33.0 (checksum verified), creates a Kubernetes 1.37.0
+cluster (node image pinned by digest), builds and loads both images, installs `test/e2e/config`, runs `make e2e-test`,
+and on failure prints the rollouts, Deployments, pods, Events, logs and Prometheus's targets (`make e2e-diagnose`).
 
 ## Design decisions
 

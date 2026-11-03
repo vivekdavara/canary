@@ -421,7 +421,10 @@ Rules, and why:
   passed while the operator wasn't running, followed by the stable's deletion; day 2's rule would have recreated the
   stable from the failed template at all replicas (the review found it). A rollback decided by a failed check leaves
   no trace in a lost status write but a check due again, so with the stable gone mid-pause a due check runs first
-  (the same two calls) and decides (the second round found that). Pods that became ready late still count: the step
+  (the same two calls) and decides (the second round found that). Only for a pause the normal path wouldn't restart
+  (the canary at the template's revision and the step's count, or more once the pause is over), and only if the status
+  doesn't already say the rollout failed: otherwise the branch would check, count and roll back where the normal path
+  clears the failures or rolls back without a check (the fourth round found both). Pods that became ready late still count: the step
   then starts, as on the normal path, and a deleted stable is recreated from the template as on day 2.
 - **A rollback whose status write is lost is decided again.** The Deployments are written first, so the stable may
   already be back at `replicas`. The next decision rolls back again if the deadline is still past; after a failed
@@ -429,6 +432,65 @@ Rules, and why:
   count (capacity holds throughout).
 - **The canary drains under the capacity rules.** A new rollout started while a rolled-back canary still drains treats
   it as any canary with more pods than its step's (`waitForCanary`): kept until the stable is settled.
+
+## End to end (day 4)
+
+envtest has no pods: its Deployments never get any, and the tests set their status by hand. The end-to-end tests
+(`test/e2e`, build tag `e2e`) run the operator on a real cluster instead, kind in CI, where a real Deployment
+controller starts real pods, a real Prometheus scrapes them, and the operator, installed from its image by
+`config/default`, decides on what Prometheus measured.
+
+```mermaid
+flowchart LR
+  subgraph kind["kind cluster (CI)"]
+    op["canary operator<br/>2 replicas, leader election<br/>(config/default)"]
+    prom[("Prometheus<br/>pod discovery, 2s scrapes")]
+    subgraph ns["a test's namespace"]
+      load["load generator<br/>40 requests/s,<br/>a new connection each"] --> svc["Service good<br/>app=good"]
+      svc --> stable["good-stable pods"]
+      svc --> canary["good-canary pods"]
+    end
+    prom -- "/metrics" --> stable
+    prom -- "/metrics" --> canary
+    op -- "instant queries" --> prom
+  end
+  test["go test -tags e2e<br/>(on the runner)"] -- "API server" --> kind
+  test -- "127.0.0.1:9090<br/>(NodePort)" --> prom
+```
+
+- **The demo app** (`test/e2e/demoapp`) answers `/` and fails a share of requests set by `ERROR_RATIO`,
+  deterministically (request n fails when floor(n * ratio) goes up), and counts them in `demo_requests_total{code}`,
+  both codes from the start: an error-rate quotient over a version that hasn't failed is 0, not empty (empty fails a
+  check). `READY=false` fails its readiness probe forever. In load mode it sends requests at a fixed rate, each on a new
+  connection, because kube-proxy balances connections: one connection per request spreads them by pod count, the
+  split the operator relies on ("The pieces").
+- **Prometheus** (`test/e2e/config/prometheus.yaml`) discovers pods through the API server and scrapes container ports
+  named `metrics` every 2 seconds, keeping the operator's pod labels as `rollout`, `track` and `revision`, so a query
+  selects `track="canary"` as the sample's do. It scrapes the operator too. `test/e2e/kind.yaml` publishes its NodePort
+  on the runner's `127.0.0.1:9090` for the tests' own queries.
+- **The operator** runs as `config/default` installs it (two replicas, leader election, the generated ClusterRole bound
+  to its service account), with `--prometheus-url` added by `test/e2e/config`.
+
+Each test gets its own namespace, a Service, a load generator, and a rollout with an error-rate metric (the canary's
+500s over all its requests, over 20 seconds, at most 0.05), checked every 5 seconds, tolerating two failed checks a step
+(the first can come before Prometheus has two scrapes of a new pod, which a rate needs):
+
+| Test | The new version | What must happen |
+|---|---|---|
+| `TestAGoodVersionIsPromoted` | fails no requests | Both steps (25%, 50%, 15s pauses) pass and it is promoted. The passing check measured an error rate of 0; the Events include `RolloutStarted`, `StepAdvanced`, `Promoting`, `Promoted`. At each step's end the pods' counters give the canary's actual share of the requests. |
+| `TestABadVersionIsRolledBack` | fails half of them | Rolled back after `failureLimit + 1` failed checks, at least one of which measured an error rate above the max (so the rollback isn't from missing data); the status and Events say so. |
+| `TestAVersionThatNeverBecomesReadyIsRolledBackAtTheDeadline` | never becomes ready | Rolled back by the 20s progress deadline, with no other event to wake the operator, never before it, and no checks run. |
+| `TestARolloutSurvivesTheLeaderCrashing` | fails no requests | The leader's pod is deleted with no grace period early in a 40s pause. The other replica takes the Lease when it expires, carries the step on from the status (the pause keeps the start the old leader wrote) and promotes, with one of each Event. It runs alone, before the others, so its handover doesn't hold up their rollouts. |
+
+All three then wait until only the surviving revision's pods are left, all ready, and the canary at 0, and fail if
+the two Deployments' ready pods (sampled every 100 ms) ever went below `replicas` after the first version was up.
+`TestThePrometheusClientAgainstPrometheus` sends the client the answers the unit tests only had canned: a scalar,
+NaN and both infinities, an empty and a two-sample vector, a matrix, a string, an info annotation (it passes: it says
+nothing about the data), a warning (it fails: the answer may be wrong) and a parse error.
+
+`make e2e` runs it all on any machine with Docker and kind (`make e2e-down` deletes the cluster); CI runs it on every
+push (`.github/workflows/ci.yml`, the `e2e` job). Not covered: several nodes, a leader that hangs rather than crashes
+(it keeps the Lease until its renewals fail), and traffic through a mesh.
 
 ## Testing
 
@@ -447,8 +509,8 @@ Rules, and why:
   and the Prometheus client against canned API responses.
 - **The reconcile's own mechanisms** are tested by calling `Reconcile` by hand through an interceptor client: the
   optimistic lock (the spec changes between read and patch), and that a reconcile with nothing new writes nothing.
-- **kind** in CI on day 4: a real cluster with a real Deployment controller, one rollout that passes and one that
-  fails and rolls back.
+- **kind** in CI (day 4): a real cluster, a real Deployment controller and a real Prometheus; a rollout promoted, one
+  rolled back by its analysis, one by the deadline, and one promoted across a leader crash ("End to end").
 
 ## Limitations
 

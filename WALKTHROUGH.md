@@ -350,6 +350,65 @@ operator with the real client against a fake API server that answers every query
 request and back to the status, runs. No real Prometheus runs here (none is installed); the responses follow its
 documented format, which a real server in CI would confirm.
 
+## End to end (day 4)
+
+**What do the end-to-end tests show that envtest couldn't?** envtest is an API server and etcd with no controllers,
+so a Deployment never gets pods, and days 2 and 3 wrote Deployment status by hand. On kind a real Deployment
+controller starts real pods, readiness comes from real probes, a real Prometheus scrapes real counters, and the
+operator runs from its image with the generated permissions (`config/default`). Three rollouts: one promoted, one
+rolled back by its analysis, one rolled back by the progress deadline, and one promoted across a leader crash
+(`test/e2e/e2e_test.go`; DESIGN "End to end").
+
+**How does the bad version fail its analysis?** The demo app with `ERROR_RATIO=0.5` fails every second request. The
+metric is the canary's rate of 500s over the rate of all its requests, over 20 seconds, at most 0.05; Prometheus
+measures about 0.5, so each check fails, and the third failure (the limit is 2) rolls back. The test also requires at
+least one failed check to have *measured* a value above the max, so it can't pass because a query found nothing.
+
+**Why does the demo app export its 500 counter at 0 from the start?** Without the series, the numerator is an empty
+vector, the quotient is empty, and an empty answer fails the check: a version that never failed a request would be
+rolled back. Real applications need the same care (initialise the label values you divide by).
+
+**Why does the load generator open a new connection per request?** kube-proxy balances connections, not requests.
+With keep-alive a client stays on the pod it first reached, and the replica ratio says nothing about the share of
+requests (README "Limitations"). One connection per request makes the split follow the pod count, and the test
+measures what share the canary actually got from the pods' own counters.
+
+**Why tolerate two failed checks in the good rollout?** The first check comes 5 seconds into a pause, possibly before
+Prometheus has scraped the new pod twice, and a rate needs two samples: the answer is empty and the check fails closed,
+as it should. `failureLimit` is the knob for exactly this; a real rollout with 30-second intervals has the same issue
+at its first check.
+
+**How do you check capacity on a real cluster?** A goroutine reads both Deployments every 100 ms and keeps the fewest
+ready pods it saw; each test fails if that went below `replicas` after the first version was up. It is a sample, not
+a proof (a dip shorter than 100 ms could be missed); the random walks are the proof-like part, this checks them
+against a real Deployment controller.
+
+**How do the tests reach Prometheus?** Its Service is a NodePort (30090), and `test/e2e/kind.yaml` maps that port of
+the kind node to the runner's `127.0.0.1:9090`.
+
+**Why test the Prometheus client against a real Prometheus?** The unit tests' answers were written from the API's
+documentation. A real one confirms the encodings (`"NaN"`, `"+Inf"`, `"-Inf"` as strings), that an instant query of a
+range is a matrix, that a parse error is `bad_data`, and where Prometheus 3 puts info annotations and warnings (the
+client ignores the first and fails on the second).
+
+**Why build the binaries outside Docker?** The Go build is cached on the runner and takes seconds; the image only
+copies a static binary onto distroless (pinned by digest). A multi-stage build would download a Go image and every
+module inside Docker on each run.
+
+**Why does the e2e run two operator replicas?** That is how `config/default` installs it, so leader election runs with
+the Role in its own namespace, as in a real install.
+
+**What happens when the leader crashes mid-rollout?** `TestARolloutSurvivesTheLeaderCrashing` deletes the leader's
+pod with no grace period early in a step's pause. Nothing reconciles until the Lease expires (15 seconds after the
+last renewal, controller-runtime's default); then the other replica takes it, reads the status (phase, step, the
+pause's start, the checks) and the two Deployments, and carries on: the pause keeps the start the old leader wrote,
+a check that came due meanwhile runs at once, and the rollout is promoted with one `RolloutStarted` and one `Promoted`
+Event. That works because the operator keeps no state of its own; everything is in the status and the Deployments.
+The pods keep serving throughout: a dead operator stops decisions, not traffic.
+
+**What isn't covered?** Several nodes, a leader that hangs instead of crashing (it keeps the Lease until its renewals
+fail, 10 seconds by default), and traffic through a mesh or Gateway API.
+
 ## The review (day 1)
 
 **What did the review find?**
@@ -476,7 +535,29 @@ own mutant run, and why the README says round 3's fixes are unreviewed.
 It never deleted a Deployment: I wrote it for analysis and the deadline, and left deletions to day 2's walk, which has
 no analysis. The review's walk combines them, and it's in the repository now (`review_d3_walk_test.go`).
 
-## What went wrong on day 3
+## The review (day 4)
+
+**What did the fourth review find?** It reviewed round 3's fixes, which nobody had. Nothing on the normal path; two
+cases where the branch for a deleted stable decided differently from the normal path: a lowered `failureLimit` made
+it run and count a check the normal path skips, and a pause the normal path would restart (after a `replicas` edit)
+was still checked and could roll back. Both now go through the normal path's own rule (`pauseCurrent` in
+`internal/rollout/decide.go`), and `alreadyFailed` is asked before any check. It also found three mutants of the
+stored-time repair that no test killed; each has a test now.
+
+**Why do the reviews keep finding bugs in the fixes?** Each fix adds a branch that must agree with the rest of the
+state machine on rare inputs (a deleted stable, an edit, a lost write). The rounds narrowed: round 1 found a medium
+issue, rounds 2 and 3 bugs in the fixes, round 4 two low-severity disagreements. The lesson I'd state: a special case
+should reuse the normal path's predicates (`pauseCurrent`) rather than restate them, since restating is where they
+drifted.
+
+## What went wrong on day 4
+
+- My first e2e run: the promotion test read `status.analysis` after the promotion, which clears it (nil), and
+  panicked; and the Prometheus contract test waited for `workqueue_depth`, which controller-runtime v0.25's priority
+  queue exports only once something has been queued (none had: the contract test runs before any rollout). It now
+  uses Prometheus's own `up` series. Both fixed in `6302a1f`; the rollbacks and the promotion itself worked on the
+  first run.
+
 
 - My first check-time rounding (up) made a 1s interval check every 2s; my second (down) let two checks run 100 ms
   apart. Both came from forcing check times into seconds; a `MicroTime` was the fix.
