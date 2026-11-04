@@ -1,14 +1,4 @@
-# What the end-to-end tests run on kind (make e2e-install): the operator as config/default installs it, pointed at a
-# Prometheus of the tests' own (prometheus.yaml).
+# The end-to-end tests' Prometheus (prometheus.yaml), applied by make e2e-install. The operator itself is installed
+# by the chart (charts/canary), pointed at this Prometheus with --set prometheus.url.
 resources:
-  - ../../../config/default
   - prometheus.yaml
-patches:
-  - target:
-      kind: Deployment
-      name: canary
-      namespace: canary-system
-    patch: |-
-      - op: add
-        path: /spec/template/spec/containers/0/args/-
-        value: --prometheus-url=http://prometheus.canary-e2e.svc:9090

@@ -94,9 +94,12 @@ e2e: e2e-cluster e2e-install e2e-test
 e2e-cluster:
 	$(KIND) create cluster --name $(KIND_CLUSTER) --image $(KIND_NODE_IMAGE) --config test/e2e/kind.yaml --wait 2m
 
-e2e-install: images $(SETUP_ENVTEST)
+# The operator is installed by the chart, as a user would (its default image is canary:dev, the one loaded here).
+e2e-install: images $(SETUP_ENVTEST) $(HELM)
 	$(KIND) load docker-image --name $(KIND_CLUSTER) canary:dev canary-demoapp:dev
 	$(KUBECTL) apply --server-side -k test/e2e/config
+	$(HELM) install canary charts/canary --kube-context kind-$(KIND_CLUSTER) -n canary-system --create-namespace \
+		--set prometheus.url=http://prometheus.canary-e2e.svc:9090
 	$(KUBECTL) -n canary-system rollout status deployment/canary --timeout 2m
 	$(KUBECTL) -n canary-e2e rollout status deployment/prometheus --timeout 2m
 

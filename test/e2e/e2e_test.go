@@ -1,8 +1,8 @@
 //go:build e2e
 
 // Package e2e runs CanaryRollouts on a real cluster (kind, in CI; make e2e): a real Deployment controller starting
-// real pods of test/e2e/demoapp, a real Prometheus scraping them, and the operator from its image, installed by
-// config/default with test/e2e/config's overlay. DESIGN.md, "End to end", says what each test shows.
+// real pods of test/e2e/demoapp, a real Prometheus scraping them (test/e2e/config), and the operator from its image,
+// installed by its Helm chart (charts/canary). DESIGN.md, "End to end", says what each test shows.
 //
 // It needs the cluster set up by make e2e-install (the operator and Prometheus running, the images loaded) and
 // Prometheus's API on CANARY_E2E_PROMETHEUS (http://127.0.0.1:9090, where test/e2e/kind.yaml publishes it).
