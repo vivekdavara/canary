@@ -1,0 +1,42 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: canary-manager
+rules:
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - create
+  - list
+  - update
+  - watch
+- apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - rollouts.vivekdavara.github.io
+  resources:
+  - canaryrollouts
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - rollouts.vivekdavara.github.io
+  resources:
+  - canaryrollouts/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - rollouts.vivekdavara.github.io
+  resources:
+  - canaryrollouts/status
+  verbs:
+  - patch

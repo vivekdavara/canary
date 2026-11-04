@@ -1,0 +1,87 @@
+{{- if and (gt (int .Values.replicaCount) 1) (not .Values.leaderElection.enabled) }}
+{{- fail "replicaCount above 1 needs leaderElection.enabled: without it every replica reconciles, and they overwrite each other's decisions" }}
+{{- end }}
+# The operator: the same container as config/manager/manager.yaml (non-root, read-only root filesystem, no
+# capabilities, both probes), with the Prometheus address and the query timeout from the values.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "canary.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "canary.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "canary.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "canary.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "canary.fullname" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: canary
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            {{- if .Values.leaderElection.enabled }}
+            - --leader-elect
+            {{- end }}
+            - --metrics-bind-address=:{{ .Values.metricsPort }}
+            - --health-probe-bind-address=:{{ .Values.probesPort }}
+            {{- with .Values.prometheus.url }}
+            - --prometheus-url={{ . }}
+            {{- end }}
+            - --analysis-timeout={{ .Values.analysisTimeout }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.metricsPort }}
+            - name: probes
+              containerPort: {{ .Values.probesPort }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: probes
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: probes
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: 30

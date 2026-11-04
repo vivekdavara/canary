@@ -1,0 +1,61 @@
+# The operator's permissions, as config/rbac has them. The ClusterRole's rules are files/role.yaml's, the role
+# controller-gen generates from the reconciler's rbac markers (make manifests copies it here), so the chart grants
+# exactly what the code says it needs. It is bound cluster-wide, since rollouts can be in any namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "canary.fullname" . }}-manager
+  labels:
+    {{- include "canary.labels" . | nindent 4 }}
+rules:
+  {{- (.Files.Get "files/role.yaml" | fromYaml).rules | toYaml | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "canary.fullname" . }}-manager
+  labels:
+    {{- include "canary.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "canary.fullname" . }}-manager
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "canary.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- if .Values.leaderElection.enabled }}
+---
+# With leader election, the Lease the leader holds and renews, and the Events it records on taking it, in the
+# release's namespace only (in a cluster the operator keeps its Lease in its own namespace).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "canary.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "canary.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "canary.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "canary.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "canary.fullname" . }}-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "canary.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

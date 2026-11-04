@@ -1,0 +1,9 @@
+The canary operator is installed in {{ .Release.Namespace }} ({{ .Values.replicaCount }} replica{{ if gt (int .Values.replicaCount) 1 }}s, leader election{{ end }}).
+{{- if not .Values.prometheus.url }}
+
+No prometheus.url is set: every analysis check fails closed, so a rollout with analysis rolls back. Set it with
+  helm upgrade {{ .Release.Name }} <chart> -n {{ .Release.Namespace }} --reuse-values --set prometheus.url=http://<prometheus>:9090
+{{- end }}
+
+Try a rollout (the sample in the repository: config/samples/web.yaml), then watch it:
+  kubectl get canaryrollouts -w
