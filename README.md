@@ -125,14 +125,15 @@ With Helm (tested with 4.3.1, the version the repository pins; `$(make -s helm)`
 helm install canary charts/canary -n canary-system --create-namespace --set prometheus.url=http://prometheus.monitoring.svc:9090
 ```
 
-That installs the CRD, a `canary` service account with the generated ClusterRole bound cluster-wide and the
-leader-election Role in `canary-system`, and the operator (two replicas, leader election). The values
-([charts/canary/values.yaml](charts/canary/values.yaml)) are checked by a schema: an unknown key, a URL with a query,
-a timeout that isn't a duration, or two replicas without leader election are refused before anything is installed.
-Without `prometheus.url` every check fails closed and a rollout with analysis rolls back; the install notes say so.
-`helm uninstall` removes the operator and keeps the CRD, so the rollouts and their Deployments stay (unmanaged); Helm
-never upgrades a CRD either, so a release that changes it needs `kubectl apply --server-side -f charts/canary/crds/`
-first (DESIGN.md, "Installing it").
+That installs the CRD, a `canary` service account (objects are named after the release) with the generated
+ClusterRole bound cluster-wide and the leader-election Role in `canary-system`, and the operator (two replicas, leader
+election). The values ([charts/canary/values.yaml](charts/canary/values.yaml)) are checked against what the operator
+accepts before anything is installed: an unknown key, a URL or timeout the operator would refuse at start, equal
+ports, a `podLabels` key the chart sets, or two replicas without leader election are refused. Without
+`prometheus.url` every check fails closed and a rollout with analysis rolls back; the install notes say so. `helm
+uninstall` removes the operator and keeps the CRD, so the rollouts and their Deployments stay (unmanaged); Helm never
+upgrades a CRD either, so a release that changes it needs `kubectl apply --server-side --field-manager=helm -f
+charts/canary/crds/` first (DESIGN.md, "Installing it"). Install one operator per cluster.
 
 With kustomize, the same objects (a test compares the two):
 
@@ -469,7 +470,12 @@ e2e-diagnose`).
 - The end-to-end tests run on one kind node in CI only (there is no Docker on the machine it was built on); several
   nodes, a hung (not crashed) leader and traffic through a mesh aren't covered.
 - No published image or chart repository: the chart installs from the repository, with an image you build.
-- Helm installs the CRD but never upgrades it: a release that changes the CRD needs it applied by hand first.
+- Helm installs the CRD but never upgrades it: a release that changes the CRD needs it applied by hand first (as
+  Helm's field manager, or the next `helm install` conflicts).
+- One operator per cluster isn't enforced: a second release of another name, in another namespace, would reconcile
+  every rollout too (the Lease is per namespace).
+- If a reconcile is still running at the manager's 30 s shutdown timeout, the stopping leader gives the Lease up
+  anyway (DESIGN.md, "Leader election").
 - A check fails closed, so a Prometheus outage rolls rollouts in progress back once `failureLimit` is used up.
 - Reconciles run one at a time and a check runs inside one: a slow Prometheus delays other rollouts by up to
   `--analysis-timeout` per check.

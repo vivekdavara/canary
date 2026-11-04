@@ -482,9 +482,10 @@ Each test gets its own namespace, a Service, a load generator, and a rollout wit
 | `TestABadVersionIsRolledBack` | fails half of them | Rolled back after `failureLimit + 1` failed checks, at least one of which measured an error rate above the max (so the rollback isn't from missing data); the status and Events say so. |
 | `TestAVersionThatNeverBecomesReadyIsRolledBackAtTheDeadline` | never becomes ready | Rolled back by the 20s progress deadline, with no other event to wake the operator, never before it, and no checks run. |
 | `TestATightQuotaHoldsARollbackWithTheCanaryServing` | fails a metric once the canary has two pods | A pod quota of `replicas + 2` fits every forward step but not the rollback from the 50% step: 30s after it the stable is still short (its ReplicaSet refused by the quota) and the rolled-back canary still serves. A limitation reproduced ("Limitations"); the test fails if the rollback ever finishes. |
-| `TestARolloutSurvivesTheLeaderCrashing` | fails no requests | The leader's pod is deleted with no grace period early in a 40s pause. The other replica takes the Lease when it expires, carries the step on from the status (the pause keeps the start the old leader wrote) and promotes, with one of each Event. It runs alone, before the others, so its handover doesn't hold up their rollouts. |
+| `TestARolloutSurvivesTheLeaderCrashing` | fails no requests | The leader's process is killed (SIGKILL through the node's `crictl`, day 5; day 4 deleted its pod with no grace period, which since day 5 is a stop) early in a 40s pause. The other replica takes the Lease when it expires, carries the step on from the status (the pause keeps the start the old leader wrote) and promotes, with one of each Event. It runs alone, before the others, so its handover doesn't hold up their rollouts. |
+| `TestARolloutSurvivesAnOperatorUpgrade` | fails no requests | Day 5: `helm upgrade` changes the operator's pod template early in a 40s pause, so its Deployment replaces both pods, each stopped with SIGTERM. The Lease changes hands within a second of the old leader being told to stop ("Leader election"), and the rollout is promoted as above. Also alone. |
 
-All three then wait until only the surviving revision's pods are left, all ready, and the canary at 0, and fail if
+All of them then wait until only the surviving revision's pods are left, all ready, and the canary at 0, and fail if
 the two Deployments' ready pods (sampled every 100 ms) ever went below `replicas` after the first version was up.
 `TestThePrometheusClientAgainstPrometheus` sends the client the answers the unit tests only had canned: a scalar,
 NaN and both infinities, an empty and a two-sample vector, a matrix, a string, an info annotation (it passes: it says
@@ -518,22 +519,43 @@ flowchart LR
   the copied file (`.Files.Get "files/role.yaml" | fromYaml`), so a new rbac marker reaches the chart with no edit.
 - **The chart and `config/default` are checked against each other.** `TestTheChartInstallsWhatConfigDefaultDoes`
   renders both and compares them object by object: the same kinds and names (for a release named `canary` in
-  `canary-system`), the same CRD spec, rules, role references and subjects, the same replicas and pod spec. The
-  differences are the chart's own: the namespace comes from `helm install --create-namespace`, the objects carry
-  Helm's labels (the selector also the release's instance, so two releases' pods don't mix), and the operator gets
-  `--analysis-timeout` spelled out. An edit to one that isn't made to the other fails it.
-- **The values are checked before anything is installed.** `values.schema.json` refuses unknown keys (a misspelt
-  `prometheusUrl` would otherwise be ignored silently, and every check would fail closed), `replicaCount` below 1, a
-  Prometheus URL with a user, query or fragment (the operator would refuse it at start, in a crash loop), a timeout
-  that isn't a duration, and ports out of range. More than one replica without leader election fails the render:
-  both replicas would reconcile, and write over each other's decisions.
-- **Names follow the release**: `<release>` if it says canary, else `<release>-canary`, and `-manager` for the
-  cluster-wide role and binding, so two releases don't fight over a ClusterRole. One operator per cluster is still the
-  rule: the Lease is per namespace, so two releases in different namespaces would both reconcile every rollout.
+  `canary-system`), the same CRD spec, rules, role references and subjects, the same ServiceAccount, and the same
+  Deployment spec as a whole. The differences are the chart's own: the namespace comes from `helm install
+  --create-namespace`, the objects carry Helm's labels (the selector also the release's instance, so two releases'
+  pods don't mix; the test checks the pods carry every label of both), and the operator gets `--analysis-timeout`
+  spelled out. An edit to the Deployment, the account, the CRD or the permissions in one that isn't made to the other
+  fails it; the day 5 review's first version of this test compared less and let ten such edits through (README,
+  "Review of day 5").
+- **The values are checked before anything is installed, against what the operator accepts.** `values.schema.json`
+  refuses unknown keys (a misspelt `prometheusUrl` would otherwise be ignored silently, and every check would fail
+  closed) and `replicaCount` below 1. The Prometheus URL must match a subset of what the operator's own check
+  (`url.Parse`, then no user, query or fragment) accepts: `http` or `https`, a host name or a bracketed IPv6 address,
+  a port of digits, a path of unreserved characters and well-formed `%`-escapes. The timeout must be a positive Go
+  duration with numbers of at most five digits, at most seven of them, so it can't overflow. A value the operator
+  refuses at start would otherwise pass the install and crash-loop the pod. The rules a schema can't state fail the
+  render: more than one replica without leader election (both replicas would reconcile and write over each other's
+  decisions), the same port for metrics and probes, and a `podLabels` key the chart sets itself (the selector's
+  labels: an override would detach the pods from their Deployment). Both directions are tested: each value the review
+  found is refused, and ten accepted values, the unusual ones too (an IPv6 address, an escaped path, `25000µs`, the
+  largest timeout the pattern allows), start the real binary against envtest.
+- **Without leader election the pod is replaced by stopping the old one first** (`strategy: Recreate`). A rolling
+  update starts the new pod beside the old one, and with no Lease both would reconcile. With leader election the
+  default rolling update is right: the new pod waits for the Lease, which the old one gives up as it stops ("Leader
+  election", below).
+- **Objects are named exactly after the release** (`-manager` for the cluster-wide role and binding,
+  `-leader-election` for the Lease's), so two releases never share a name. The first version appended `-canary` to a
+  release that didn't say canary, and the review found `foo` and `foo-canary` sharing a ClusterRole. One operator per
+  cluster is still the rule, and only partly enforced: a second release of the same name in another namespace is
+  refused by Helm (the ClusterRole is the first release's), one of another name isn't, and it would reconcile every
+  rollout too (the Lease is per namespace).
 - **The CRD is in `crds/`**, which Helm installs before the templates and never upgrades or deletes. Never deleting
   it is the point: deleting a CRD deletes every rollout in it, and with them (by owner references) every application's
   Deployments; uninstalling the operator leaves the rollouts and their pods running, unmanaged. Not upgrading it means
-  a release that changes the CRD needs `kubectl apply --server-side -f charts/canary/crds/` before `helm upgrade`.
+  a release that changes the CRD needs `kubectl apply --server-side --field-manager=helm -f charts/canary/crds/` before
+  `helm upgrade`. The field manager matters: Helm 4 applies `crds/` server-side as the manager `helm`, so kubectl's own
+  manager conflicts, and with `--force-conflicts` kubectl takes the fields and a later `helm install` of the chart
+  conflicts with `kubectl` instead (both found in the review; `TestReviewD5DocumentedCRDUpgradeCommandConflicts` runs
+  the command and an install after it).
 - **There is no published image.** The chart's default image is `canary:dev`, what `make images` builds and what the
   end-to-end tests load into kind; a cluster that pulls from a registry needs `--set image.repository=... --set
   image.tag=...`.
@@ -544,6 +566,32 @@ The chart's tests (`charts/chart_test.go`) also install it for real on envtest's
 without the CRD so the chart's own is the one served: the operator's account may do what `config/default`'s may and
 nothing more (the same `kubectl auth can-i` table), an upgrade changes an argument, and an uninstall removes the
 operator and keeps the CRD and a rollout in it. The end-to-end tests install the operator on kind with the chart.
+
+## Leader election (day 5)
+
+The operator runs two replicas; one holds a Lease (`canary.rollouts.vivekdavara.github.io` in its namespace,
+controller-runtime's leader election: 15 s duration, renewed every 2 s) and reconciles, the other waits. What the
+wait costs depends on how the leader goes:
+
+- **Stopped** (an upgrade, a node drain, a scale-down, `kubectl delete pod`, even with no grace period: the kubelet
+  sends SIGTERM first). Since day 5 the operator gives the Lease up as it stops (`LeaderElectionReleaseOnCancel`), and
+  the other replica takes it on its next try. Measured: a second operator led 54-55 ms after the first stopped on
+  envtest (`TestRunReleasesTheLeaseWhenStopped`; 15.9 s before the change), and on kind, after a `helm upgrade`
+  mid-rollout, the Lease changed hands 0.7 s after the old leader was told to stop (15.1 s before;
+  `TestARolloutSurvivesAnOperatorUpgrade`, "Results at v1.0.0").
+- **Crashed** (killed, out of memory, its node gone): nothing gives the Lease up, and the other replica takes it when
+  it expires, up to 15 s plus a retry later. The crash test kills the leader's process with SIGKILL through the
+  node's container runtime to get exactly that.
+
+Either way nothing is lost: the operator keeps no state of its own, so the next leader carries on from the status and
+the two Deployments (a pause keeps the start the old leader wrote, a check due meanwhile runs at once).
+
+The release is safe because controller-runtime gives the Lease up only after the manager's runnables, the reconcilers
+among them, have stopped, and `run` returns, ending the process, right after. A reconcile in progress finishes first: at
+most one analysis check, bounded by `--analysis-timeout` (10 s by default). The one exception is the manager's
+graceful-shutdown timeout (30 s): if a reconcile hasn't finished by then, the manager gives the Lease up anyway and
+the process exits with it still running. The pod's `terminationGracePeriodSeconds` is also 30 s, so the kubelet's
+SIGKILL may come first, in which case the Lease simply expires.
 
 ## Testing
 
@@ -582,7 +630,9 @@ operator and keeps the CRD and a rollout in it. The end-to-end tests install the
   ready pods serving 36.4% of the requests 30 s later (`TestATightQuotaHoldsARollbackWithTheCanaryServing`, which
   fails if the rollback ever finishes, so a fix must update this). A fix has to trade capacity for it: shrinking the
   canary a pod at a time when the stable reports a quota failure frees room one pod at a time, at one ready pod below
-  `replicas` meanwhile. Keeping only its ready pods wouldn't help here (they are all ready) and a Deployment spreads a
+  `replicas` meanwhile. The signal is there without watching ReplicaSets: in CI runs 41857784753 and later the stable
+  Deployment itself showed `ReplicaFailure=True` (`FailedCreate`) during the hold. Not fixed in v1.0.0 (WALKTHROUGH,
+  "The release"). Keeping only its ready pods wouldn't help here (they are all ready) and a Deployment spreads a
   scale-down over its ReplicaSets, so a canary mid-template-change could lose ready pods.
 - **Reconciles run one at a time**, and a check runs inside one, so a slow Prometheus holds up other rollouts by up to
   `--analysis-timeout` per check (the metrics of one check are queried in parallel).

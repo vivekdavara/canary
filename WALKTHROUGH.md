@@ -420,13 +420,27 @@ module inside Docker on each run.
 **Why does the e2e run two operator replicas?** That is how the chart (and `config/default`) installs it, so leader
 election runs with the Role in its own namespace, as in a real install.
 
-**What happens when the leader crashes mid-rollout?** `TestARolloutSurvivesTheLeaderCrashing` deletes the leader's
-pod with no grace period early in a step's pause. Nothing reconciles until the Lease expires (15 seconds after the
-last renewal, controller-runtime's default); then the other replica takes it, reads the status (phase, step, the
+**What happens when the leader crashes mid-rollout?** `TestARolloutSurvivesTheLeaderCrashing` kills the leader's
+process with SIGKILL early in a step's pause (through the kind node's `crictl`; on day 4 it deleted the pod with no
+grace period, but the kubelet sends SIGTERM even then, and since day 5 that's a clean stop). Nothing reconciles until
+the Lease expires (15 seconds after the last renewal, controller-runtime's default); then the other replica takes it, reads the status (phase, step, the
 pause's start, the checks) and the two Deployments, and carries on: the pause keeps the start the old leader wrote,
 a check that came due meanwhile runs at once, and the rollout is promoted with one `RolloutStarted` and one `Promoted`
 Event. That works because the operator keeps no state of its own; everything is in the status and the Deployments.
 The pods keep serving throughout: a dead operator stops decisions, not traffic.
+
+**What happens when you upgrade the operator mid-rollout?** `helm upgrade` changes its pod template, so its
+Deployment replaces the two pods one at a time, each stopped with SIGTERM. Until day 5 a stopped leader kept its
+Lease until it expired, so every upgrade or node drain meant up to 15 seconds with nobody reconciling: the e2e
+measured 15.1 s from the old leader being told to stop to the new one holding the Lease. Now the operator sets
+controller-runtime's `LeaderElectionReleaseOnCancel`, and it was 0.7 s on kind (54-55 ms on envtest, from 15.9 s).
+It's safe because the Lease is given up only after the reconcilers have stopped, and the process exits right after;
+the one gap is a reconcile still running at the manager's 30 s shutdown timeout (DESIGN, "Leader election").
+
+**Doesn't that make the crash test pass for the wrong reason?** It did, briefly: with the release in place the crash
+test's handover dropped to 0.6 s, because deleting a pod with grace period 0 still gets the process a SIGTERM. A
+real crash can't release anything, so the test now SIGKILLs the container through the node's container runtime and
+compares Lease holders by identity (the container restarts in the same pod, with a new UUID).
 
 **What did the e2e find that envtest couldn't?** The ResourceQuota limitation. A rolled-back canary keeps its pods
 until the stable is back, so capacity never drops; with a pod quota that fits every forward step (`replicas + 2`), a
@@ -455,15 +469,21 @@ object; changing the Deployment's security context, a role's verbs, or a binding
 
 **What does the values schema buy?** Failures at `helm install` instead of in the cluster. Without it a misspelt key
 (`prometheusUrl`) is silently ignored, the operator starts with no Prometheus, and every check fails closed, rolling
-everything back; a URL with a `?` makes the operator exit at start, a crash loop. `additionalProperties: false`, a URL
-pattern, a duration pattern and port ranges catch those before anything is created. The one rule a schema can't say,
-more than one replica needs leader election, is a `fail` in the Deployment template.
+everything back; a URL the operator refuses makes it exit at start, a crash loop. My first patterns were looser than
+the operator: the review found seven values they passed and the binary refused (`:9O90`, a space, an unclosed IPv6
+bracket, `%zz`, `0s`, `9999999h`, equal ports). Now the URL pattern is a subset of what `url.Parse` accepts, the
+duration pattern refuses zero and can't overflow, and a test runs the real binary with the arguments ten accepted
+values render, so the schema and the operator are checked to agree in both directions. The rules a schema can't say
+are `fail`s in the template: more than one replica without leader election, equal ports, a `podLabels` key the chart
+sets.
 
 **Why is the CRD in `crds/` and not a template?** Helm installs `crds/` first and never deletes it. Deleting the CRD
 would delete every `CanaryRollout`, and through owner references every application Deployment the operator manages:
 `helm uninstall` would take down the applications. The price: Helm never upgrades `crds/` either, so a release that
-changes the CRD needs a `kubectl apply --server-side -f charts/canary/crds/` first. The test checks that an uninstall
-leaves the CRD and a rollout in place.
+changes the CRD needs `kubectl apply --server-side --field-manager=helm -f charts/canary/crds/` first. The field
+manager is the subtle part: Helm 4 applies the CRD server-side as `helm`, so kubectl as itself conflicts, and
+`--force-conflicts` makes kubectl the owner, after which a later `helm install` conflicts instead. A test runs the
+command, checks the change took, and installs again. Another checks that an uninstall leaves the CRD and a rollout.
 
 **How is the chart tested without a cluster?** On envtest: a package-level API server started without the CRD, so the
 chart's own CRD is the one served. `helm install` against it, then the same `kubectl auth can-i` table as
@@ -484,8 +504,9 @@ result on any machine with Go, and the CI cache keys on the Makefile, so a versi
 case I can't yet detect reliably. Finishing the rollback means shrinking the rolled-back canary before the stable is
 back, one ready pod below `replicas` for a while, and doing it only when the quota is the reason. The operator watches
 Deployments, not ReplicaSets, and the quota refusal is on the stable's ReplicaSet; whether the Deployment controller
-copies it onto the Deployment for a plain scale-up isn't clear from its source, so the e2e now reports what the
-Deployment says before a fix relies on it. A fix to `Decide`'s capacity rules also needs its own random-walk moves and
+copies it onto the Deployment for a plain scale-up wasn't clear from its source, so the e2e reports what the
+Deployment says, and it does: `ReplicaFailure=True`, reason `FailedCreate` (CI run 41857784753 onwards). That makes
+the fix possible without new watches, not safe yet. A fix to `Decide`'s capacity rules also needs its own random-walk moves and
 a review round, and most earlier fixes to those rules had bugs that the next review round found. So it ships documented (README and
 DESIGN "Limitations"), with a test that fails the day the behaviour changes.
 
@@ -493,6 +514,25 @@ DESIGN "Limitations"), with a test that fails the day the behaviour changes.
 include quota refusals); record the step on the canary Deployment, which removes the two lost-write cases where a step
 runs again; run checks outside the reconcile so one slow Prometheus can't hold up other rollouts; Gateway API
 `HTTPRoute` weights as an alternative to the replica ratio; publish the image and chart from CI.
+
+## The review (day 5)
+
+**What did the review of the chart find?** Six defects, each as a failing test (`charts/review_d5_*_test.go`): the
+schema passed seven values the operator exits on; the documented CRD upgrade command conflicted with Helm's field
+manager; one replica without leader election got a rolling update, which runs two operators at once; `podLabels`
+could override the selector's labels; `imagePullSecrets` took plain strings the API server refuses; and releases
+`foo` and `foo-canary` shared a ClusterRole name. Also ten mutants of the chart and of `config/manager` that every
+test let through, because the comparison test looked only at parts of the Deployment. All fixed, the comparison now
+covers whole objects, and each fix and survivor was re-run as a mutant. A second round reviewed the fixes and the
+Lease release (README, "Review of day 5").
+
+**What went wrong on day 5?** My first schema patterns were written from what I thought the operator refused, not
+from its code, and only the review's "run the binary with the rendered arguments" test showed the gap. My first
+naming rule (append `-canary` unless the name says canary) wasn't one-to-one. My first fix for the CRD upgrade
+(`--force-conflicts`) moved the conflict to the next `helm install`, which the reviewer's test found when it ran
+after it. And the Lease release silently changed what the crash test tested; only reading its new number (0.6 s)
+showed it. A test I hadn't touched, `TestAFailingAnalysisRollsBack`, failed once in CI: it read the Events once,
+right after seeing the status, and Events are sent asynchronously; it waits for them now.
 
 ## The review (day 1)
 
