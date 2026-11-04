@@ -44,7 +44,13 @@ type Env struct {
 var current *Env
 
 // Main starts the API server, runs the package's tests and stops it. Call it from TestMain: os.Exit(testenv.Main(m)).
-func Main(m *testing.M) int {
+func Main(m *testing.M) int { return start(m, true) }
+
+// MainWithoutCRDs is Main with an API server that doesn't have the CanaryRollout CRD, for tests that install it
+// themselves (the chart's).
+func MainWithoutCRDs(m *testing.M) int { return start(m, false) }
+
+func start(m *testing.M, withCRDs bool) int {
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
 		if os.Getenv("CANARY_REQUIRE_ENVTEST") != "" {
 			fmt.Fprintln(os.Stderr, "testenv: CANARY_REQUIRE_ENVTEST is set but KUBEBUILDER_ASSETS isn't (make test sets both)")
@@ -61,9 +67,10 @@ func Main(m *testing.M) int {
 		fmt.Fprintln(os.Stderr, "testenv:", err)
 		return 1
 	}
-	te := &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join(repoRoot(), "config", "crd", "bases")},
-		ErrorIfCRDPathMissing: true,
+	te := &envtest.Environment{}
+	if withCRDs {
+		te.CRDDirectoryPaths = []string{filepath.Join(repoRoot(), "config", "crd", "bases")}
+		te.ErrorIfCRDPathMissing = true
 	}
 	// Start installs the CRD and waits until it is served, so a CRD the API server refuses (a CEL rule over its
 	// cost budget, say) fails here.
@@ -110,6 +117,25 @@ func (e *Env) OperatorConfig(t testing.TB) *rest.Config {
 func (e *Env) OperatorKubeconfig(t testing.TB) string {
 	t.Helper()
 	data, err := e.operatorUser(t).KubeConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "kubeconfig")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// AdminKubeconfig writes a kubeconfig for an administrator (system:masters) into the test's temporary directory and
+// returns its path, for tools other than kubectl (helm).
+func (e *Env) AdminKubeconfig(t testing.TB) string {
+	t.Helper()
+	user, err := e.te.AddUser(envtest.User{Name: "admin", Groups: []string{"system:masters"}}, e.Config)
+	if err != nil {
+		t.Fatalf("adding an administrator: %v", err)
+	}
+	data, err := user.KubeConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,4 +252,33 @@ func repoRoot() string {
 		panic("testenv: no caller information")
 	}
 	return filepath.Join(filepath.Dir(file), "..", "..")
+}
+
+// CheckOperatorPermissions asks the API server (kubectl auth can-i, as the service account sa, "namespace:name") what
+// the operator's account may do, and fails the test where an answer isn't what the operator is meant to hold: what
+// the generated ClusterRole grants, in every namespace; the Lease, only in leaseNamespace; and nothing else (no
+// deleting Deployments, no Secrets, no pods).
+func (e *Env) CheckOperatorPermissions(t testing.TB, sa, leaseNamespace string) {
+	t.Helper()
+	as := "--as=system:serviceaccount:" + sa
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"watch", "canaryrollouts.rollouts.vivekdavara.github.io", "-A"}, "yes"},
+		{[]string{"patch", "canaryrollouts.rollouts.vivekdavara.github.io", "--subresource=status", "-n", "default"}, "yes"},
+		{[]string{"update", "canaryrollouts.rollouts.vivekdavara.github.io", "-n", "default"}, "no"},
+		{[]string{"create", "deployments.apps", "-n", "default"}, "yes"},
+		{[]string{"delete", "deployments.apps", "-n", "default"}, "no"},
+		{[]string{"update", "leases.coordination.k8s.io", "-n", leaseNamespace}, "yes"},
+		{[]string{"update", "leases.coordination.k8s.io", "-n", "default"}, "no"},
+		{[]string{"get", "secrets", "-n", leaseNamespace}, "no"},
+		{[]string{"create", "pods", "-n", "default"}, "no"},
+	} {
+		stdout, stderr, err := e.Kubectl(append([]string{"auth", "can-i", as}, c.args...)...)
+		// can-i exits 1 for "no", so the answer is the output, not the error.
+		if got := strings.TrimSpace(stdout); got != c.want {
+			t.Errorf("can-i %s: %q (%v, %s), want %q", strings.Join(c.args, " "), got, err, stderr, c.want)
+		}
+	}
 }

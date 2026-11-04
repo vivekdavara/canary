@@ -75,27 +75,7 @@ func TestTheOperatorsManifestsApply(t *testing.T) {
 
 	// The service account holds the generated ClusterRole everywhere and the Lease's Role only in its own
 	// namespace; nothing else.
-	as := "--as=system:serviceaccount:canary-system:canary"
-	for _, c := range []struct {
-		args []string
-		want string
-	}{
-		{[]string{"watch", "canaryrollouts.rollouts.vivekdavara.github.io", "-A"}, "yes"},
-		{[]string{"patch", "canaryrollouts.rollouts.vivekdavara.github.io", "--subresource=status", "-n", "default"}, "yes"},
-		{[]string{"update", "canaryrollouts.rollouts.vivekdavara.github.io", "-n", "default"}, "no"},
-		{[]string{"create", "deployments.apps", "-n", "default"}, "yes"},
-		{[]string{"delete", "deployments.apps", "-n", "default"}, "no"},
-		{[]string{"update", "leases.coordination.k8s.io", "-n", "canary-system"}, "yes"},
-		{[]string{"update", "leases.coordination.k8s.io", "-n", "default"}, "no"},
-		{[]string{"get", "secrets", "-n", "canary-system"}, "no"},
-		{[]string{"create", "pods", "-n", "default"}, "no"},
-	} {
-		stdout, stderr, err := env.Kubectl(append([]string{"auth", "can-i", as}, c.args...)...)
-		// can-i exits 1 for "no", so the answer is the output, not the error.
-		if got := strings.TrimSpace(stdout); got != c.want {
-			t.Errorf("can-i %s: %q (%v, %s), want %q", strings.Join(c.args, " "), got, err, stderr, c.want)
-		}
-	}
+	env.CheckOperatorPermissions(t, "canary-system:canary", "canary-system")
 
 	// The Deployment runs the operator as that account, with leader election, both ports and the probes.
 	stdout, stderr, err = env.Kubectl("get", "deployment", "canary", "-n", "canary-system", "-o",
