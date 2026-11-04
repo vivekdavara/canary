@@ -4,17 +4,21 @@ A Kubernetes operator for canary rollouts. A `CanaryRollout` holds a pod templat
 operator runs the new version beside the old one in steps (10% of the pods, then 50%, ...), checks Prometheus metrics
 against thresholds at each step, and either promotes the new version or rolls it back.
 
-Status: **day 4 of 5**: the operator runs rollouts and decides them, and runs on a real cluster. On a template change
-it starts the new version in a canary Deployment beside the stable one, moves pods to it step by step (each step's
-pause running once its pods are ready), checks Prometheus metrics during each pause, and promotes the new version
-after the last step or rolls it back (a failed analysis, or a step whose pods aren't ready by the progress deadline),
-without ever dropping below `replicas` ready pods. CI runs it on kind from its image, with a real Deployment
-controller and a real Prometheus measuring a demo app's real errors: one version promoted, one rolled back by its
-analysis, one by the deadline ("Results (day 4)"). [DESIGN.md](DESIGN.md) is the specification;
-[WALKTHROUGH.md](WALKTHROUGH.md) has the questions an interviewer is likely to ask.
+Status: **v1.0.0** (2026-11-04; [CHANGELOG.md](CHANGELOG.md)). On a template change the operator starts the new
+version in a canary Deployment beside the stable one, moves pods to it step by step (each step's pause running once
+its pods are ready), checks Prometheus metrics during each pause, and promotes the new version after the last step or
+rolls it back (a failed analysis, or a step whose pods aren't ready by the progress deadline), without ever dropping
+below `replicas` ready pods. It installs with a Helm chart or a kustomization. CI runs it on kind from its image,
+installed by the chart, with a real Deployment controller and a real Prometheus measuring a demo app's real errors:
+one version promoted, one rolled back by its analysis, one by the deadline, one promoted across the leader being
+killed ("Results at v1.0.0").
 
-Go 1.27, controller-runtime v0.25, Kubernetes 1.37 (envtest locally, kind v0.33 in CI), Prometheus 3.15 in the e2e. MIT
-licensed.
+Reading order: this README; [DESIGN.md](DESIGN.md), the specification (the API, the state machine, analysis,
+rollback, end to end, installing); [WALKTHROUGH.md](WALKTHROUGH.md), the questions an interviewer is likely to ask,
+answered from the code; then `internal/rollout/decide.go` (every decision) and `internal/controller/` (the reconcile).
+
+Go 1.27, controller-runtime v0.25, Kubernetes 1.37 (envtest locally, kind v0.33 in CI), Prometheus 3.15 in the e2e,
+Helm 4.3. MIT licensed.
 
 ## Why
 
@@ -86,6 +90,8 @@ The full example is [config/samples/web.yaml](config/samples/web.yaml) (a test a
 | `config/rbac/service_account.yaml`, `bindings.yaml` | the operator's service account in `canary-system`, bound to both roles |
 | `config/manager/` | the operator's Deployment (two replicas, leader election, non-root, read-only root filesystem) |
 | `config/default/` | the kustomization installing all of it: `kubectl apply --server-side -k config/default` |
+| `charts/canary/` | the Helm chart installing the same objects; `crds/` and `files/role.yaml` are copies of the generated files (`make manifests`) |
+| `charts/chart_test.go` | the chart's tests: rendered against `config/default`, the values it refuses, `helm install`/upgrade/uninstall on envtest |
 | `config/samples/` | example rollouts |
 | `internal/revision/` | a template's revision: 16 hex digits of the SHA-256 of its JSON |
 | `internal/rollout/` | the pod split and the state machine (`Decide`: steps, pauses, checks, the deadline, rollback), pure functions |
@@ -103,22 +109,39 @@ The full example is [config/samples/web.yaml](config/samples/web.yaml) (a test a
 make check
 ```
 
-That installs the pinned tools into `bin/` on first use (controller-gen v0.21.0, setup-envtest v0.25.2, and envtest's
-kube-apiserver and etcd for Kubernetes 1.37.0), regenerates the deep copies, CRD and ClusterRole, and runs gofmt, go
-vet and every test. A plain `go test ./...` skips the envtest suites; `make test` makes them fail instead if their
-binaries are missing.
+That installs the pinned tools into `bin/` on first use (controller-gen v0.21.0, setup-envtest v0.25.2, Helm v4.3.1,
+and envtest's kube-apiserver and etcd for Kubernetes 1.37.0), regenerates the deep copies, CRD and ClusterRole (and
+the chart's copies of them), and runs gofmt, go vet, `helm lint --strict` and every test. A plain `go test ./...`
+skips the envtest and Helm suites; `make test` makes them fail instead if their binaries are missing.
 
-Against a cluster (kind, minikube, or any cluster your kubeconfig points at), either run the operator in the
-cluster from its image (`make images` builds `canary:dev`; load it into kind with `kind load docker-image canary:dev`,
-or push it to a registry and set it in an overlay):
+## Install it in a cluster
+
+There is no published image: build it (`make images` builds `canary:dev`; `kind load docker-image canary:dev` puts it
+in a kind cluster) or push it to a registry of yours and set `image.repository` and `image.tag`.
+
+With Helm (tested with 4.3.1, the version the repository pins; `$(make -s helm)` prints its path):
+
+```bash
+helm install canary charts/canary -n canary-system --create-namespace --set prometheus.url=http://prometheus.monitoring.svc:9090
+```
+
+That installs the CRD, a `canary` service account with the generated ClusterRole bound cluster-wide and the
+leader-election Role in `canary-system`, and the operator (two replicas, leader election). The values
+([charts/canary/values.yaml](charts/canary/values.yaml)) are checked by a schema: an unknown key, a URL with a query,
+a timeout that isn't a duration, or two replicas without leader election are refused before anything is installed.
+Without `prometheus.url` every check fails closed and a rollout with analysis rolls back; the install notes say so.
+`helm uninstall` removes the operator and keeps the CRD, so the rollouts and their Deployments stay (unmanaged); Helm
+never upgrades a CRD either, so a release that changes it needs `kubectl apply --server-side -f charts/canary/crds/`
+first (DESIGN.md, "Installing it").
+
+With kustomize, the same objects (a test compares the two):
 
 ```bash
 kubectl apply --server-side -k config/default
 ```
 
-That installs the CRD, the `canary` service account in `canary-system` with the generated ClusterRole and the
-leader-election Role, and the operator (two replicas, leader election). Add `--prometheus-url` to its arguments with
-an overlay, as `test/e2e/config` does. Or install only the CRD and run the operator from here:
+Add `--prometheus-url` to the operator's arguments with an overlay. Or install only the CRD and run the operator from
+here:
 
 ```bash
 kubectl apply --server-side -f config/crd/bases
@@ -128,20 +151,22 @@ kubectl apply --server-side -f config/crd/bases
 go run ./cmd/canary --kubeconfig ~/.kube/config --prometheus-url http://localhost:9090
 ```
 
+Then a rollout:
+
 ```bash
 kubectl apply -f config/samples/web.yaml && kubectl get canaryrollouts
 ```
 
-The CRD needs `--server-side`: with the pod template's schema and descriptions it is 636,521 bytes, and a client-side
-apply would store all of it in an annotation limited to 256 KiB (DESIGN.md, "Why these choices"). The sample
-creates `web-stable` at 10 pods; change its image and `kubectl get crl -w` shows the phase, the step and the canary's
-actual share as the pods become ready (`kubectl get deploy -l rollouts.vivekdavara.github.io/rollout=web` shows the
-two Deployments, `kubectl events --for canaryrollout/web` the Events). The operator serves metrics on `:8111` and `/healthz` and `/readyz` on `:8121`. With
-`--leader-elect` (for more than one replica) it also needs `--leader-election-namespace` outside a cluster, and
-`config/rbac/leader_election_role.yaml` bound in that namespace (the Lease and its Events). Without
-`--prometheus-url`, a rollout with analysis fails its first check and rolls back (it says so in its `AnalysisPassing`
-condition); the sample's queries assume the application exports `http_requests_total` and a latency histogram, and
-that Prometheus keeps the operator's `track` pod label as `track`. `--analysis-timeout` (10s) bounds each query.
+The CRD needs `--server-side` with kubectl: with the pod template's schema and descriptions it is 638,009 bytes, and a
+client-side apply would store all of it in an annotation limited to 256 KiB (DESIGN.md, "Why these choices"; Helm
+creates it without one). The sample creates `web-stable` at 10 pods; change its image and `kubectl get crl -w` shows
+the phase, the step and the canary's actual share as the pods become ready (`kubectl get deploy -l
+rollouts.vivekdavara.github.io/rollout=web` shows the two Deployments, `kubectl events --for canaryrollout/web` the
+Events). The operator serves metrics on `:8111` and `/healthz` and `/readyz` on `:8121`. With `--leader-elect` (for
+more than one replica) it also needs `--leader-election-namespace` outside a cluster, and
+`config/rbac/leader_election_role.yaml` bound in that namespace (the Lease and its Events). The sample's queries assume
+the application exports `http_requests_total` and a latency histogram, and that Prometheus keeps the operator's
+`track` pod label as `track`. `--analysis-timeout` (10s) bounds each query.
 
 ## Tests
 
@@ -168,11 +193,14 @@ play its part: they write a Deployment's status (`markReady`) when its pods woul
 | `internal/controller/reconcile_test.go` | `Reconcile` called by hand through an interceptor client: a status computed from a spec that changed before the patch is refused (the optimistic lock); a reconcile with nothing new writes nothing; a second operator (fixed clocks, ten minutes apart) keeps a paused step's start time |
 | `internal/controller/canaryrollout_controller_test.go` | status follows the spec through template and replica changes; fields the reconciler doesn't own are kept; a missing rollout is no error |
 | `cmd/canary/main_test.go` | the binary from its flags and a kubeconfig: probes answer, a rollout is reconciled, the reconcile is counted in its metrics, a clean stop; with `--leader-elect` it takes the Lease using only the leader-election Role; `--help`; bad `--prometheus-url` and `--analysis-timeout` values refused with the flag named |
-| `config/install_test.go` | the README's install steps with envtest's kubectl: client-side apply of the CRD fails ("Too long"), `--server-side` works, the sample applies, `kubectl get crl` shows the columns; `config/default` applies, and `kubectl auth can-i` as its service account shows what it may do and what not (delete Deployments, read Secrets, take a Lease outside `canary-system`); the e2e overlay applies |
+| `config/install_test.go` | the README's install steps with envtest's kubectl: client-side apply of the CRD fails ("Too long"), `--server-side` works, the sample applies, `kubectl get crl` shows the columns; `config/default` applies, and `kubectl auth can-i` as its service account shows what it may do and what not (delete Deployments, read Secrets, take a Lease outside `canary-system`); the e2e tests' Prometheus applies |
+| `charts/chart_test.go` | the Helm chart with the pinned helm: a release named `canary` renders `config/default`'s objects (same names, CRD spec, rules, role references, subjects, replicas and pod spec); its `crds/` and `files/role.yaml` are byte copies of the generated files; names per release; one replica without leader election has no Lease role; eleven values refused, each with its message; the notes warn without `prometheus.url`; `helm install` on an API server without the CRD (the chart's served, the account's permissions as `config/default`'s), an upgrade, an uninstall keeping the CRD and a rollout |
 | `test/e2e/demoapp/main_test.go` (unit) | the demo app: the failure schedule (any n consecutive requests fail floor or ceil of n * ratio), the exposition (both codes from the start), the probes, the config refusing bad values, a clean stop, the load generator's rate and one connection per request |
-| `test/e2e/e2e_test.go` (kind, CI) | DESIGN "End to end": a good version promoted, a bad one rolled back on measured error rates, one that never becomes ready rolled back at the deadline, one promoted across the leader's pod being killed mid-pause (the pause kept), capacity sampled every 100 ms throughout; the Prometheus client against a real Prometheus |
+| `test/e2e/e2e_test.go` (kind, CI; the operator installed by the chart) | DESIGN "End to end": a good version promoted, a bad one rolled back on measured error rates, one that never becomes ready rolled back at the deadline, one promoted across the leader's pod being killed mid-pause (the pause kept), capacity sampled every 100 ms throughout; the Prometheus client against a real Prometheus |
 
-Checks that the tests can fail, each run as a mutant. Day 3: letting a step held for its first check scale an
+Checks that the tests can fail, each run as a mutant. Day 5: a writable root filesystem in the chart's Deployment, an
+extra verb in its Lease role, and its ClusterRoleBinding's subject in another namespace each fail
+`TestTheChartInstallsWhatConfigDefaultDoes` (the last also `TestHelmInstallUpgradeUninstall`). Day 3: letting a step held for its first check scale an
 oversized canary down fails `TestRandomWalksWithAnalysis` and `TestAStepHeldForItsCheckKeepsTheCanaryWhileTheStableIsShort`;
 comparing the failure limit only after a failed check fails the walk and `TestALoweredFailureLimitRollsBack`. Day 2:
 removing any one of the three capacity rules in `Decide` fails
@@ -412,10 +440,12 @@ Found by my own tests and reading, before the review:
 
 ## CI
 
-`.github/workflows/ci.yml`, two jobs on every push: `test` runs `make check` on Ubuntu, then a check that the generated
-files were committed, then the build; `e2e` installs kind v0.33.0 (checksum verified), creates a Kubernetes 1.37.0
-cluster (node image pinned by digest), builds and loads both images, installs `test/e2e/config`, runs `make e2e-test`,
-and on failure prints the rollouts, Deployments, pods, Events, logs and Prometheus's targets (`make e2e-diagnose`).
+`.github/workflows/ci.yml`, two jobs on every push: `test` runs `make check` on Ubuntu (the chart's tests and `helm
+lint` included), then a check that the generated files (and the chart's copies of them) were committed, then the
+build; `e2e` installs kind v0.33.0 (checksum verified), creates a Kubernetes 1.37.0 cluster (node image pinned by
+digest), builds and loads both images, applies the tests' Prometheus and installs the operator with the chart, runs
+`make e2e-test`, and on failure prints the rollouts, Deployments, pods, Events, logs and Prometheus's targets (`make
+e2e-diagnose`).
 
 ## Design decisions
 
@@ -436,8 +466,10 @@ and on failure prints the rollouts, Deployments, pods, Events, logs and Promethe
 
 ## Limitations
 
-- No run on a real cluster yet (day 4: kind in CI), and no real Prometheus here: the client is tested against
-  responses in the API's documented format.
+- The end-to-end tests run on one kind node in CI only (there is no Docker on the machine it was built on); several
+  nodes, a hung (not crashed) leader and traffic through a mesh aren't covered.
+- No published image or chart repository: the chart installs from the repository, with an image you build.
+- Helm installs the CRD but never upgrades it: a release that changes the CRD needs it applied by hand first.
 - A check fails closed, so a Prometheus outage rolls rollouts in progress back once `failureLimit` is used up.
 - Reconciles run one at a time and a check runs inside one: a slow Prometheus delays other rollouts by up to
   `--analysis-timeout` per check.

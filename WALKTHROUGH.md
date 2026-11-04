@@ -2,7 +2,28 @@
 
 Questions an interviewer is likely to ask about Canary, with short answers grounded in the code. Day 1 covered the
 design, the API and its validation, revisions and the test setup; day 2 the rollout itself (the split, the state
-machine, the reconciler's reads and writes); day 3 the analysis and rollback.
+machine, the reconciler's reads and writes); day 3 the analysis and rollback; day 4 the end-to-end tests on kind;
+day 5 the Helm chart and the v1.0.0 release.
+
+## In two minutes
+
+Canary is a Kubernetes operator for canary rollouts, in Go with controller-runtime. You give it a `CanaryRollout`: a
+pod template, a replica count, steps like "10% for 2 minutes, then 50% for 5", and Prometheus queries with
+thresholds. When the template changes, it runs the new version in a second Deployment beside the old one and moves
+pods to it step by step; the application's own Service selects both, so the canary's share of pods is its share of
+traffic. During each step's pause it queries Prometheus every interval; too many failed checks, or a step whose pods
+never become ready, rolls back, and passing every step promotes. It never goes below `replicas` ready pods: it scales
+up before it scales down, and keeps the old pods until the new ones are ready.
+
+The design choice I'd lead with: every decision is one pure function, `rollout.Decide(Input) Plan` (the spec, its
+revision, the last status, the two Deployments, the time, and a check's result when one ran), and the reconciler only
+reads, calls it, and writes (Deployments, then the status with an optimistic lock, then
+Events). That makes the hard part, the state machine under restarts, lost writes, deletions and edits, testable
+without a cluster: seeded random walks run tens of thousands of rollouts and check capacity after every decision.
+Those walks and nine review agents over four days found most of the bugs. Then CI runs it for real on kind, installed by its Helm
+chart, with a real Prometheus: a good version promoted, a bad one rolled back on measured error rates, one rolled back
+by the deadline, and one promoted across the leader's pod being killed. The e2e also found a limitation the unit tests
+couldn't: under a tight ResourceQuota a rollback can hold with the bad version still serving.
 
 ## The idea
 
@@ -355,8 +376,9 @@ documented format, which a real server in CI would confirm.
 **What do the end-to-end tests show that envtest couldn't?** envtest is an API server and etcd with no controllers,
 so a Deployment never gets pods, and days 2 and 3 wrote Deployment status by hand. On kind a real Deployment
 controller starts real pods, readiness comes from real probes, a real Prometheus scrapes real counters, and the
-operator runs from its image with the generated permissions (`config/default`). Three rollouts: one promoted, one
-rolled back by its analysis, one rolled back by the progress deadline, and one promoted across a leader crash
+operator runs from its image with the generated permissions (installed by the Helm chart since day 5,
+`config/default` on day 4). Four rollouts: one promoted, one rolled back by its analysis, one rolled back by the
+progress deadline, and one promoted across a leader crash
 (`test/e2e/e2e_test.go`; DESIGN "End to end").
 
 **How does the bad version fail its analysis?** The demo app with `ERROR_RATIO=0.5` fails every second request. The
@@ -395,8 +417,8 @@ client ignores the first and fails on the second).
 copies a static binary onto distroless (pinned by digest). A multi-stage build would download a Go image and every
 module inside Docker on each run.
 
-**Why does the e2e run two operator replicas?** That is how `config/default` installs it, so leader election runs with
-the Role in its own namespace, as in a real install.
+**Why does the e2e run two operator replicas?** That is how the chart (and `config/default`) installs it, so leader
+election runs with the Role in its own namespace, as in a real install.
 
 **What happens when the leader crashes mid-rollout?** `TestARolloutSurvivesTheLeaderCrashing` deletes the leader's
 pod with no grace period early in a step's pause. Nothing reconciles until the Lease expires (15 seconds after the
@@ -416,6 +438,61 @@ meanwhile. I'd make it the default, since serving a version that failed its anal
 
 **What isn't covered?** Several nodes, a leader that hangs instead of crashing (it keeps the Lease until its renewals
 fail, 10 seconds by default), and traffic through a mesh or Gateway API.
+
+## Installing it (day 5)
+
+**Why a Helm chart and a kustomization?** Helm is how most clusters install operators (values, upgrades, uninstall),
+kustomize is how others do, and `config/default` already existed and was tested. Two ways means two places to drift,
+so the chart doesn't hand-write what the code generates, and a test compares them.
+
+**How does the chart stay in sync with the code?** The CRD comes from the Go types and the ClusterRole from the
+reconciler's `+kubebuilder:rbac` markers (controller-gen, `make manifests`). The chart holds byte copies of those two
+files, made by the same `make manifests`, because Helm can't read files outside the chart; CI fails if a copy is
+stale. The ClusterRole template doesn't list rules at all: `(.Files.Get "files/role.yaml" | fromYaml).rules`. And
+`TestTheChartInstallsWhatConfigDefaultDoes` renders the chart and the kustomization and compares them object by
+object; changing the Deployment's security context, a role's verbs, or a binding's subject in one of them fails it
+(each tried as a mutant).
+
+**What does the values schema buy?** Failures at `helm install` instead of in the cluster. Without it a misspelt key
+(`prometheusUrl`) is silently ignored, the operator starts with no Prometheus, and every check fails closed, rolling
+everything back; a URL with a `?` makes the operator exit at start, a crash loop. `additionalProperties: false`, a URL
+pattern, a duration pattern and port ranges catch those before anything is created. The one rule a schema can't say,
+more than one replica needs leader election, is a `fail` in the Deployment template.
+
+**Why is the CRD in `crds/` and not a template?** Helm installs `crds/` first and never deletes it. Deleting the CRD
+would delete every `CanaryRollout`, and through owner references every application Deployment the operator manages:
+`helm uninstall` would take down the applications. The price: Helm never upgrades `crds/` either, so a release that
+changes the CRD needs a `kubectl apply --server-side -f charts/canary/crds/` first. The test checks that an uninstall
+leaves the CRD and a rollout in place.
+
+**How is the chart tested without a cluster?** On envtest: a package-level API server started without the CRD, so the
+chart's own CRD is the one served. `helm install` against it, then the same `kubectl auth can-i` table as
+`config/default`'s test (the operator's account may watch rollouts and create Deployments, may not delete them or read
+Secrets, may take a Lease only in its own namespace), then `helm upgrade` changing an argument, then `helm uninstall`.
+envtest runs no pods; the e2e on kind installs the chart and runs rollouts on it.
+
+**Where does the image come from?** Nowhere public: the chart defaults to `canary:dev`, which `make images` builds and
+the e2e loads into kind. Publishing an image was out of scope for this project (no registry pushes); a real release
+would push to a registry from CI and default the tag to the chart's `appVersion`.
+
+**Why pin Helm and build it with `go install`?** Same as controller-gen and setup-envtest: `make check` gives the same
+result on any machine with Go, and the CI cache keys on the Makefile, so a version bump rebuilds it.
+
+## The release (day 5)
+
+**Why ship v1.0.0 with the ResourceQuota hold unfixed?** Because the fix gives up the operator's main guarantee in a
+case I can't yet detect reliably. Finishing the rollback means shrinking the rolled-back canary before the stable is
+back, one ready pod below `replicas` for a while, and doing it only when the quota is the reason. The operator watches
+Deployments, not ReplicaSets, and the quota refusal is on the stable's ReplicaSet; whether the Deployment controller
+copies it onto the Deployment for a plain scale-up isn't clear from its source, so the e2e now reports what the
+Deployment says before a fix relies on it. A fix to `Decide`'s capacity rules also needs its own random-walk moves and
+a review round, and most earlier fixes to those rules had bugs that the next review round found. So it ships documented (README and
+DESIGN "Limitations"), with a test that fails the day the behaviour changes.
+
+**What would you do next?** In order: the quota fix above (shrink a pod at a time on a quota failure, walks that
+include quota refusals); record the step on the canary Deployment, which removes the two lost-write cases where a step
+runs again; run checks outside the reconcile so one slow Prometheus can't hold up other rollouts; Gateway API
+`HTTPRoute` weights as an alternative to the replica ratio; publish the image and chart from CI.
 
 ## The review (day 1)
 
