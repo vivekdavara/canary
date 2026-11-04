@@ -239,10 +239,12 @@ two failures allowed:
   | `helm upgrade` (SIGTERM) | 15.1 s | 0.7 s / 1.4 s |
   | SIGKILL | 17.6 s (the pod deleted with grace 0) | 16.3 s / 15.8 s |
 
+  The run at `56f33ee` (41867248610) counts every handover while the operator's two pods are replaced, in case the
+  Lease passes to the other old pod first: one handover, 1.2 s with no running leader (SIGKILL that run: 16.5 s).
   On envtest (this Mac, three runs): a second operator led 54-55 ms after the first stopped, 15.9 s before the change
   (`go test -run TestRunReleasesTheLeaseWhenStopped -v ./cmd/canary/` with `KUBEBUILDER_ASSETS` set).
 - **Capacity**: the two Deployments' ready pods, sampled every 100 ms, never went below `replicas` in any rollout of
-  any e2e run today (six, the crash and the upgrade included).
+  any e2e run today (seven, the crash and the upgrade included).
 - **The replica ratio as a traffic split**: the canary served 22.1% and 25.8% of the requests at the 25%
   step (1 pod of 4), 51.9% and 47.0% at the 50% step.
 - **The ResourceQuota hold**, reproduced in every run: 30 s after a rollback from the 50% step the stable had 3 of 4

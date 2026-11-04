@@ -433,7 +433,9 @@ The pods keep serving throughout: a dead operator stops decisions, not traffic.
 Deployment replaces the two pods one at a time, each stopped with SIGTERM. Until day 5 a stopped leader kept its
 Lease until it expired, so every upgrade or node drain meant up to 15 seconds with nobody reconciling: the e2e
 measured 15.1 s from the old leader being told to stop to the new one holding the Lease. Now the operator sets
-controller-runtime's `LeaderElectionReleaseOnCancel`, and it was 0.7 s on kind (54-55 ms on envtest, from 15.9 s).
+controller-runtime's `LeaderElectionReleaseOnCancel`, and it was 0.7 s and 1.4 s on kind (54-55 ms on envtest, from
+15.9 s). A later run counts every handover during the operator's rollout, since the Lease could pass to the other old
+pod first and then move again: one handover, 1.2 s.
 It's safe because the Lease is given up only after the reconcilers have stopped, and the process exits right after;
 the one gap is a reconcile still running at the manager's 30 s shutdown timeout (DESIGN, "Leader election").
 
