@@ -618,22 +618,35 @@ func TestAVersionThatNeverBecomesReadyIsRolledBackAtTheDeadline(t *testing.T) {
 	w.result("rolled back %.1fs after the template changed (deadline %ds); fewest ready pods %d of %d", took.Seconds(), deadline, w.fewestReady(), replicas)
 }
 
-// leaderPod is the pod holding the operator's Lease: its holder identity is the pod's name (the hostname), "_" and a
-// UUID (controller-runtime's leader election).
-func leaderPod(t *testing.T) string {
+// leaderIdentity is the operator's Lease's holder: the pod's name (the hostname), "_" and a UUID each process makes
+// (controller-runtime's leader election); "" when nobody holds it.
+func leaderIdentity(t *testing.T) string {
 	t.Helper()
 	var lease coordinationv1.Lease
 	err := k8s.Get(context.Background(), client.ObjectKey{Namespace: "canary-system", Name: "canary.rollouts.vivekdavara.github.io"}, &lease)
 	if err != nil || lease.Spec.HolderIdentity == nil {
 		return ""
 	}
-	pod, _, _ := strings.Cut(*lease.Spec.HolderIdentity, "_")
+	return *lease.Spec.HolderIdentity
+}
+
+// leaderPod is the pod holding the operator's Lease.
+func leaderPod(t *testing.T) string {
+	t.Helper()
+	pod, _, _ := strings.Cut(leaderIdentity(t), "_")
 	return pod
 }
 
-// The leader crashes mid-step (its pod deleted with no grace period): the other replica takes the Lease when it
-// expires, carries the step on from the status (the pause isn't restarted) and promotes, and the ready pods never go
-// below replicas. Not parallel, so the handover doesn't hold up the other tests' rollouts and timings.
+// kindNode is the kind cluster's node container (make e2e-test sets it from the cluster's name).
+var kindNode = envOr("CANARY_E2E_NODE", "canary-e2e-control-plane")
+
+// The leader crashes mid-step: its process is killed with SIGKILL through the node's container runtime (crictl), so
+// it can't give the Lease up. (Day 4 deleted its pod with no grace period, but the kubelet still sends SIGTERM first,
+// and since day 5 the operator answers that by releasing the Lease: that's the upgrade test's case now.) The other
+// replica takes the Lease when it expires, carries the step on from the status (the pause isn't restarted) and
+// promotes, and the ready pods never go below replicas. The killed container restarts in the same pod, so the holder
+// is compared by identity (a new process has a new UUID), not by pod. Not parallel, so the handover doesn't hold up
+// the other tests' rollouts and timings.
 func TestARolloutSurvivesTheLeaderCrashing(t *testing.T) {
 	const replicas = 4
 	w := newWorld(t, "failover", replicas, []v1.Step{
@@ -650,18 +663,29 @@ func TestARolloutSurvivesTheLeaderCrashing(t *testing.T) {
 		return ro.Status.StepStartedAt != nil && c != nil && c.Reason == rollout.ReasonStepPaused
 	})
 	started := paused.Status.StepStartedAt.Time
-	leader := leaderPod(t)
+	leader := leaderIdentity(t)
 	if leader == "" {
 		t.Fatal("no operator holds the Lease")
 	}
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "canary-system", Name: leader}}
-	if err := k8s.Delete(context.Background(), pod, client.GracePeriodSeconds(0)); err != nil {
+	podName, _, _ := strings.Cut(leader, "_")
+	var pod corev1.Pod
+	if err := k8s.Get(context.Background(), client.ObjectKey{Namespace: "canary-system", Name: podName}, &pod); err != nil {
 		t.Fatal(err)
+	}
+	if len(pod.Status.ContainerStatuses) != 1 {
+		t.Fatalf("the leader's pod has %d containers", len(pod.Status.ContainerStatuses))
+	}
+	_, container, ok := strings.Cut(pod.Status.ContainerStatuses[0].ContainerID, "://")
+	if !ok {
+		t.Fatalf("the leader's container ID %q", pod.Status.ContainerStatuses[0].ContainerID)
+	}
+	if out, err := exec.Command("docker", "exec", kindNode, "crictl", "stop", "--timeout", "0", container).CombinedOutput(); err != nil {
+		t.Fatalf("killing the leader's container: %v: %s", err, out)
 	}
 	killed := time.Now()
 	t.Logf("+%5.1fs killed the leader, %s", time.Since(w.start).Seconds(), leader)
 	var next string
-	for next = leaderPod(t); next == "" || next == leader; next = leaderPod(t) {
+	for next = leaderIdentity(t); next == "" || next == leader; next = leaderIdentity(t) {
 		if time.Since(killed) > time.Minute {
 			t.Fatal("no new leader a minute after the old one was killed")
 		}
