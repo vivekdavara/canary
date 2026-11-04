@@ -1,13 +1,10 @@
 {{/*
-The name every object of the release is called by: the release's name, or "<release>-canary" when the release's name
-doesn't say canary. Cut to 52 characters, so "<name>-leader-election" still fits a label value's 63.
+The name every object of the release is called by: the release's name, exactly. One name per release, so two releases
+can't share a ClusterRole (a mapping that appended "-canary" to some names gave "foo" and "foo-canary" the same one).
+Helm limits release names to 53 characters, inside every limit the names here have.
 */}}
 {{- define "canary.fullname" -}}
-{{- if contains "canary" .Release.Name -}}
-{{- .Release.Name | trunc 52 | trimSuffix "-" -}}
-{{- else -}}
-{{- printf "%s-canary" .Release.Name | trunc 52 | trimSuffix "-" -}}
-{{- end -}}
+{{- .Release.Name -}}
 {{- end -}}
 
 {{/* The pods' selector. Never changes across upgrades: a Deployment's selector can't be changed. */}}

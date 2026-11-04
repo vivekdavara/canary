@@ -1,6 +1,14 @@
 {{- if and (gt (int .Values.replicaCount) 1) (not .Values.leaderElection.enabled) }}
 {{- fail "replicaCount above 1 needs leaderElection.enabled: without it every replica reconciles, and they overwrite each other's decisions" }}
 {{- end }}
+{{- if eq (int .Values.metricsPort) (int .Values.probesPort) }}
+{{- fail "metricsPort and probesPort must differ: the operator serves each on its own port" }}
+{{- end }}
+{{- range $key, $_ := .Values.podLabels }}
+{{- if hasKey (include "canary.labels" $ | fromYaml) $key }}
+{{- fail (printf "podLabels can't set %s: the chart sets it (the Deployment's selector, or Helm's own labels)" $key) }}
+{{- end }}
+{{- end }}
 # The operator: the same container as config/manager/manager.yaml (non-root, read-only root filesystem, no
 # capabilities, both probes), with the Prometheus address and the query timeout from the values.
 apiVersion: apps/v1
@@ -12,6 +20,12 @@ metadata:
     {{- include "canary.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  {{- if not .Values.leaderElection.enabled }}
+  # Without leader election nothing stops two operators reconciling at once, and a rolling update runs the new pod
+  # beside the old one: the old one stops first instead. (With leader election the new pod waits for the Lease.)
+  strategy:
+    type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       {{- include "canary.selectorLabels" . | nindent 6 }}
@@ -30,7 +44,9 @@ spec:
       serviceAccountName: {{ include "canary.fullname" . }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
+        {{- range . }}
+        - name: {{ if kindIs "string" . }}{{ . }}{{ else }}{{ .name }}{{ end }}
+        {{- end }}
       {{- end }}
       securityContext:
         runAsNonRoot: true

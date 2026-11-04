@@ -131,12 +131,20 @@ func TestTheChartInstallsWhatConfigDefaultDoes(t *testing.T) {
 		same(k, "roleRef")
 		same(k, "subjects")
 	}
-	same("Deployment/canary-system/canary", "spec", "replicas")
+	// The ServiceAccount as a whole, but for Helm's labels.
+	sa := "ServiceAccount/canary-system/canary"
+	if a, b := withoutLabels(kustomized[sa]), withoutLabels(chart[sa]); !reflect.DeepEqual(a, b) {
+		t.Errorf("%s differs:\nconfig/default: %v\nchart:          %v", sa, a, b)
+	}
 
-	// The pod spec, with the chart's one extra argument taken out.
-	podSpec := func(o *unstructured.Unstructured) map[string]any {
-		spec := field(t, o.DeepCopy(), "spec", "template", "spec").(map[string]any)
-		c := spec["containers"].([]any)[0].(map[string]any)
+	// The Deployment's whole spec: the same but for the selector and the pod's labels (the chart's include Helm's and
+	// the release's) and the chart's one extra argument.
+	dep := "Deployment/canary-system/canary"
+	normalized := func(o *unstructured.Unstructured) map[string]any {
+		spec := field(t, o.DeepCopy(), "spec").(map[string]any)
+		delete(spec, "selector")
+		delete(spec["template"].(map[string]any)["metadata"].(map[string]any), "labels")
+		c := spec["template"].(map[string]any)["spec"].(map[string]any)["containers"].([]any)[0].(map[string]any)
 		var args []any
 		for _, a := range c["args"].([]any) {
 			if a != "--analysis-timeout=10s" {
@@ -146,13 +154,100 @@ func TestTheChartInstallsWhatConfigDefaultDoes(t *testing.T) {
 		c["args"] = args
 		return spec
 	}
-	dep := "Deployment/canary-system/canary"
-	if a, b := podSpec(kustomized[dep]), podSpec(chart[dep]); !reflect.DeepEqual(a, b) {
-		t.Errorf("the operator's pod spec differs:\nconfig/default: %v\nchart:          %v", a, b)
+	if a, b := normalized(kustomized[dep]), normalized(chart[dep]); !reflect.DeepEqual(a, b) {
+		t.Errorf("the operator's Deployment spec differs:\nconfig/default: %v\nchart:          %v", a, b)
+	}
+	// The chart's selector is config/default's plus the release, and the pods carry every label of config/default's.
+	selector := field(t, chart[dep], "spec", "selector", "matchLabels").(map[string]any)
+	if want := map[string]any{"app.kubernetes.io/name": "canary", "app.kubernetes.io/instance": "canary"}; !reflect.DeepEqual(selector, want) {
+		t.Errorf("the chart's selector %v, want %v", selector, want)
+	}
+	chartPodLabels := field(t, chart[dep], "spec", "template", "metadata", "labels").(map[string]any)
+	for k, v := range field(t, kustomized[dep], "spec", "template", "metadata", "labels").(map[string]any) {
+		if chartPodLabels[k] != v {
+			t.Errorf("the chart's pods don't carry config/default's label %s=%v: %v", k, v, chartPodLabels)
+		}
+	}
+	for k, v := range selector {
+		if chartPodLabels[k] != v {
+			t.Errorf("the chart's pods don't match its selector's %s=%v: %v", k, v, chartPodLabels)
+		}
 	}
 	if got := field(t, chart[dep], "spec", "template", "spec", "containers").([]any)[0].(map[string]any)["args"]; !reflect.DeepEqual(got,
 		[]any{"--leader-elect", "--metrics-bind-address=:8111", "--health-probe-bind-address=:8121", "--analysis-timeout=10s"}) {
 		t.Errorf("the chart's default arguments: %v", got)
+	}
+}
+
+// withoutLabels is o with its labels removed.
+func withoutLabels(o *unstructured.Unstructured) map[string]any {
+	c := o.DeepCopy()
+	c.SetLabels(nil)
+	return c.Object
+}
+
+// The namespaced objects, and the bindings' subject, are in the release's namespace, whatever it is.
+func TestTheChartFollowsTheReleasesNamespace(t *testing.T) {
+	stdout, stderr, err := helm(t, "template", "canary", "./canary", "-n", "operators")
+	if err != nil {
+		t.Fatalf("helm template: %v: %s", err, stderr)
+	}
+	for _, o := range decode(t, stdout) {
+		switch o.GetKind() {
+		case "ClusterRole", "ClusterRoleBinding":
+			if o.GetNamespace() != "" {
+				t.Errorf("%s has a namespace", key(o))
+			}
+		default:
+			if o.GetNamespace() != "operators" {
+				t.Errorf("%s isn't in the release's namespace", key(o))
+			}
+		}
+		if subjects, ok := o.Object["subjects"].([]any); ok {
+			for _, s := range subjects {
+				if ns := s.(map[string]any)["namespace"]; ns != "operators" {
+					t.Errorf("%s binds a subject in %v", key(o), ns)
+				}
+			}
+		}
+	}
+}
+
+// Each scheduling and metadata value reaches the operator's pod, in the form the API server takes.
+func TestTheChartsPodValues(t *testing.T) {
+	objs := byKey(render(t, "canary",
+		"--set", "nodeSelector.kubernetes\\.io/os=linux",
+		"--set", "tolerations[0].key=dedicated,tolerations[0].operator=Exists,tolerations[0].effect=NoSchedule",
+		"--set", "affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=pool",
+		"--set", "affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator=Exists",
+		"--set-string", "podAnnotations.example\\.com/scrape=true",
+		"--set", "podLabels.team=platform",
+		"--set", "imagePullSecrets[0]=regcred", "--set", "imagePullSecrets[1].name=mirror",
+		"--set", "image.repository=registry.example.com/canary", "--set", "image.tag=v1.0.0", "--set", "image.pullPolicy=Always",
+		"--set", "resources.limits.memory=512Mi"))
+	dep := objs["Deployment/canary-system/canary"]
+	pod := field(t, dep, "spec", "template").(map[string]any)
+	spec := pod["spec"].(map[string]any)
+	meta := pod["metadata"].(map[string]any)
+	c := spec["containers"].([]any)[0].(map[string]any)
+	for _, check := range []struct {
+		what      string
+		got, want any
+	}{
+		{"nodeSelector", spec["nodeSelector"], map[string]any{"kubernetes.io/os": "linux"}},
+		{"tolerations", spec["tolerations"], []any{map[string]any{"key": "dedicated", "operator": "Exists", "effect": "NoSchedule"}}},
+		{"affinity", spec["affinity"], map[string]any{"nodeAffinity": map[string]any{"requiredDuringSchedulingIgnoredDuringExecution": map[string]any{
+			"nodeSelectorTerms": []any{map[string]any{"matchExpressions": []any{map[string]any{"key": "pool", "operator": "Exists"}}}}}}}},
+		{"annotations", meta["annotations"], map[string]any{"example.com/scrape": "true"}},
+		{"the team label", meta["labels"].(map[string]any)["team"], "platform"},
+		{"imagePullSecrets", spec["imagePullSecrets"], []any{map[string]any{"name": "regcred"}, map[string]any{"name": "mirror"}}},
+		{"image", c["image"], "registry.example.com/canary:v1.0.0"},
+		{"pullPolicy", c["imagePullPolicy"], "Always"},
+		{"resources", c["resources"], map[string]any{"requests": map[string]any{"cpu": "50m", "memory": "64Mi"}, "limits": map[string]any{"memory": "512Mi"}}},
+	} {
+		if !reflect.DeepEqual(check.got, check.want) {
+			t.Errorf("%s: %v, want %v", check.what, check.got, check.want)
+		}
 	}
 }
 
@@ -177,10 +272,11 @@ func TestTheChartsCopiesAreTheGeneratedFiles(t *testing.T) {
 	}
 }
 
-// Objects are named after the release (a release that doesn't say canary gets "-canary" appended), and one replica
-// without leader election renders neither the flag nor the Lease's Role.
+// Objects are named exactly after the release, so two releases never share a name (the review's foo and foo-canary),
+// and one replica without leader election renders neither the flag nor the Lease's Role, and replaces its pod by
+// stopping the old one first (Recreate): a rolling update would run two operators, both reconciling.
 func TestTheChartsNamesAndLeaderElection(t *testing.T) {
-	for release, want := range map[string]string{"canary": "canary", "canary-prod": "canary-prod", "rollouts": "rollouts-canary"} {
+	for release, want := range map[string]string{"canary": "canary", "foo": "foo", "foo-canary": "foo-canary"} {
 		objs := byKey(render(t, release))
 		for _, k := range []string{
 			"ServiceAccount/canary-system/" + want, "ClusterRole//" + want + "-manager", "ClusterRoleBinding//" + want + "-manager",
@@ -213,9 +309,17 @@ func TestTheChartsNamesAndLeaderElection(t *testing.T) {
 	if r := field(t, dep, "spec", "replicas"); fmt.Sprint(r) != "1" {
 		t.Errorf("replicas %v", r)
 	}
+	if typ := field(t, dep, "spec", "strategy", "type"); typ != "Recreate" {
+		t.Errorf("strategy %v without leader election, want Recreate", typ)
+	}
+	// With leader election the default rolling update is right: the new pod waits for the Lease.
+	if _, ok := byKey(render(t, "canary"))["Deployment/canary-system/canary"].Object["spec"].(map[string]any)["strategy"]; ok {
+		t.Error("a strategy is rendered with leader election")
+	}
 }
 
-// Values that would make an operator that can't work are refused at install, each with a message saying which.
+// Values that would make an operator that can't work are refused at install, each with a message saying which
+// (review_d5_values_test.go checks that values the schema accepts do start the operator).
 func TestTheChartRefusesBadValues(t *testing.T) {
 	for _, c := range []struct {
 		set  []string
@@ -232,6 +336,15 @@ func TestTheChartRefusesBadValues(t *testing.T) {
 		{[]string{"image.repository="}, "at '/image/repository'"},
 		{[]string{"metricsPort=0"}, "at '/metricsPort'"},
 		{[]string{"prometheusUrl=http://p:9090"}, "additional properties 'prometheusUrl' not allowed"},
+		{[]string{"prometheus.url=http://p:9O90"}, "at '/prometheus/url'"},
+		{[]string{"prometheus.url=http://p:9090/%zz"}, "at '/prometheus/url'"},
+		{[]string{"analysisTimeout=0s"}, "at '/analysisTimeout'"},
+		{[]string{"analysisTimeout=0m0.0s"}, "at '/analysisTimeout'"},
+		{[]string{"analysisTimeout=999999h"}, "at '/analysisTimeout'"},
+		{[]string{"metricsPort=9000", "probesPort=9000"}, "metricsPort and probesPort must differ"},
+		{[]string{`podLabels.app\.kubernetes\.io/instance=x`}, "podLabels can't set app.kubernetes.io/instance"},
+		{[]string{`podLabels.helm\.sh/chart=x`}, "podLabels can't set helm.sh/chart"},
+		{[]string{"imagePullSecrets[0].secret=regcred"}, "at '/imagePullSecrets/0'"},
 	} {
 		args := []string{"template", "canary", "./canary"}
 		for _, s := range c.set {

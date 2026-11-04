@@ -1,4 +1,4 @@
-# The operator as a Helm chart (Helm 3.8+ or 4): helm install canary charts/canary -n canary-system --create-namespace.
+# The operator as a Helm chart (tested with Helm 4.3.1): helm install canary charts/canary -n canary-system --create-namespace.
 # crds/ and files/role.yaml are copies of the generated files (make manifests writes them), so the chart can't drift
 # from the types and the reconciler's rbac markers; CI fails if a copy wasn't committed.
 apiVersion: v2
