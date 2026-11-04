@@ -103,8 +103,9 @@ e2e-install: images $(SETUP_ENVTEST) $(HELM)
 	$(KUBECTL) -n canary-system rollout status deployment/canary --timeout 2m
 	$(KUBECTL) -n canary-e2e rollout status deployment/prometheus --timeout 2m
 
-e2e-test:
-	go test -tags e2e -count=1 -v -timeout 15m ./test/e2e/
+# CANARY_HELM: the operator-upgrade test runs helm upgrade on the release e2e-install made.
+e2e-test: $(HELM)
+	CANARY_HELM=$(HELM) go test -tags e2e -count=1 -v -timeout 15m ./test/e2e/
 
 # What CI prints when the end-to-end tests fail.
 e2e-diagnose: $(SETUP_ENVTEST)

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	eventsv1 "k8s.io/api/events/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -696,6 +698,97 @@ func TestARolloutSurvivesTheLeaderCrashing(t *testing.T) {
 	}
 	w.result("the new leader took the Lease %.1fs after the old one was killed; promoted %.1fs after the template changed, the first pause kept; fewest ready pods %d of %d",
 		takeover.Seconds(), took.Seconds(), w.fewestReady(), replicas)
+}
+
+// The operator is upgraded mid-step: helm upgrade changes its pod template (an annotation), so its Deployment
+// replaces both pods one at a time, each told to stop (SIGTERM) and given its grace period, as any upgrade or node
+// drain does. The rollout carries on from the status as after a crash (the pause kept, one of each Event, capacity),
+// and the result is how long nothing reconciled: from the old leader's pod being told to stop to another pod holding
+// the Lease. Not parallel, like the crash.
+func TestARolloutSurvivesAnOperatorUpgrade(t *testing.T) {
+	helm := os.Getenv("CANARY_HELM")
+	if helm == "" {
+		t.Fatal("CANARY_HELM isn't set (make e2e-test sets it to the pinned helm)")
+	}
+	const replicas = 4
+	w := newWorld(t, "upgrade", replicas, []v1.Step{
+		{Weight: 25, Pause: &metav1.Duration{Duration: 40 * time.Second}},
+		{Weight: 50, Pause: &metav1.Duration{Duration: 10 * time.Second}},
+	}, 120, nil)
+	w.waitStable(replicas)
+	w.watchCapacity()
+
+	changed := time.Now()
+	rev := w.setVersion(v2Good)
+	paused := w.waitFor(time.Minute, "the first step's pause", func(ro *v1.CanaryRollout) bool {
+		c := meta.FindStatusCondition(ro.Status.Conditions, controller.ConditionProgressing)
+		return ro.Status.StepStartedAt != nil && c != nil && c.Reason == rollout.ReasonStepPaused
+	})
+	started := paused.Status.StepStartedAt.Time
+	leader := leaderPod(t)
+	if leader == "" {
+		t.Fatal("no operator holds the Lease")
+	}
+	out, err := exec.Command(helm, "upgrade", "canary", "../../charts/canary", "-n", "canary-system", "--reuse-values",
+		"--set-string", "podAnnotations.e2e-upgraded-at="+time.Now().UTC().Format(time.RFC3339Nano)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("helm upgrade: %v: %s", err, out)
+	}
+	upgraded := time.Now()
+	t.Logf("+%5.1fs upgraded the operator; the leader is %s", time.Since(w.start).Seconds(), leader)
+
+	// The leader's pod is told to stop when its deletion timestamp is set (or it is already gone).
+	var stopped time.Time
+	for {
+		var pod corev1.Pod
+		err := k8s.Get(context.Background(), client.ObjectKey{Namespace: "canary-system", Name: leader}, &pod)
+		if apierrors.IsNotFound(err) || (err == nil && pod.DeletionTimestamp != nil) {
+			stopped = time.Now()
+			break
+		}
+		if time.Since(upgraded) > 3*time.Minute {
+			t.Fatalf("the old leader's pod wasn't stopped within 3 minutes of the upgrade (%v)", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Logf("+%5.1fs the old leader's pod is stopping", time.Since(w.start).Seconds())
+	var next string
+	for next = leaderPod(t); next == "" || next == leader; next = leaderPod(t) {
+		if time.Since(stopped) > time.Minute {
+			t.Fatal("no new leader a minute after the old one was told to stop")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	handover := time.Since(stopped)
+	t.Logf("+%5.1fs %s took the Lease", time.Since(w.start).Seconds(), next)
+
+	final := w.waitFor(3*time.Minute, "the promotion", func(ro *v1.CanaryRollout) bool {
+		s := ro.Status
+		if s.Phase == v1.PhaseRolledBack {
+			t.Fatalf("rolled back: %s", describe(ro))
+		}
+		if s.CurrentStep != nil && *s.CurrentStep == 0 && s.StepStartedAt != nil && !s.StepStartedAt.Time.Equal(started) {
+			t.Fatalf("the new leader restarted the pause: it started at %v, now %v", started, s.StepStartedAt.Time)
+		}
+		return s.Phase == v1.PhaseHealthy && s.StableRevision == rev
+	})
+	took := time.Since(changed)
+	w.waitSettled(rev, replicas)
+
+	reasons, notes := w.events()
+	for reason, want := range map[string]int{rollout.EventRolloutStarted: 1, rollout.EventPromoting: 1, rollout.EventPromoted: 1, rollout.EventRolledBack: 0} {
+		if reasons[reason] != want {
+			t.Errorf("%d %s Events, want %d; all: %q", reasons[reason], reason, want, notes)
+		}
+	}
+	if fewest := w.fewestReady(); fewest < replicas {
+		t.Errorf("the ready pods went down to %d of %d", fewest, replicas)
+	}
+	if final.Status.StableRevision != rev {
+		t.Errorf("stable revision %q, want %q", final.Status.StableRevision, rev)
+	}
+	w.result("the old leader's pod was told to stop %.1fs after helm upgrade, and another took the Lease %.1fs after that; promoted %.1fs after the template changed, the first pause kept; fewest ready pods %d of %d",
+		stopped.Sub(upgraded).Seconds(), handover.Seconds(), took.Seconds(), w.fewestReady(), replicas)
 }
 
 // A limitation (README "Limitations"), reproduced: a namespace whose ResourceQuota leaves room for one pod beyond
