@@ -99,16 +99,21 @@ func reasons(t *testing.T, c client.Client, ns, name string) []string {
 	return out
 }
 
-// eventType is the type (Normal, Warning) of the rollout's Event with the given reason, "" when there is none.
+// eventType is the type of the rollout's Event with that reason, waiting up to 10 seconds for it: the operator records
+// Events after the status write, through controller-runtime's recorder, which sends them asynchronously, so a test
+// that saw the status can be ahead of the Event (TestAFailingAnalysisRollsBack failed so in CI run 41859466187).
+// "" if there is none by then.
 func eventType(t *testing.T, c client.Client, ns, name, reason string) string {
 	t.Helper()
-	var list eventsv1.EventList
-	if err := c.List(context.Background(), &list, client.InNamespace(ns)); err != nil {
-		t.Fatal(err)
-	}
-	for _, e := range list.Items {
-		if e.Regarding.Kind == "CanaryRollout" && e.Regarding.Name == name && e.Reason == reason {
-			return e.Type
+	for range poll(t) {
+		var list eventsv1.EventList
+		if err := c.List(context.Background(), &list, client.InNamespace(ns)); err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range list.Items {
+			if e.Regarding.Kind == "CanaryRollout" && e.Regarding.Name == name && e.Reason == reason {
+				return e.Type
+			}
 		}
 	}
 	return ""
