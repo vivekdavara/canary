@@ -215,6 +215,45 @@ Deployments fails `TestSomeoneElsesDeploymentWithTheName`. From day 1: removing 
 from `config/rbac/role.yaml` fails `TestStatusFollowsTheSpec`; removing the Lease rule fails `TestRunElectsALeader`;
 misspelling `failureLimit` in the sample fails `TestSamplesAreAccepted`.
 
+## Results at v1.0.0
+
+The end-to-end tests on kind in GitHub Actions (ubuntu-24.04, kind v0.33.0, Kubernetes 1.37.0, Prometheus 3.15.1), the
+operator installed by the chart, from the `RESULT` lines of the `e2e` job's log (`gh api
+repos/vivekdavara/canary/actions/jobs/<job>/logs`). Runs 41861704300 (at `5586d5f`) and 41864997942 (at `ca8f1ef`)
+have the v1.0.0 operator and chart; 41858973662 (at `9ff7344`) is the last run before the Lease release. Each rollout has 4 pods (the
+deadline's 2), a load generator at 40 requests a second, and checks every 5 s of the canary's error rate over 20 s,
+two failures allowed:
+
+| Rollout | Outcome | From the template change |
+|---|---|---|
+| fails no requests; steps 25% and 50%, 15 s pauses | promoted | 35.5 s / 35.7 s |
+| fails half its requests | rolled back after 3 failed checks, 2 and 3 of them measuring an error rate of about 0.5 | 16.3 s / 16.7 s |
+| never becomes ready; deadline 20 s | rolled back at the deadline, no checks | 21.1 s / 21.0 s |
+| fails no requests; the leader killed (SIGKILL) early in a 40 s pause | another process took the Lease when it expired; promoted, the pause kept | 59.1 s / 55.9 s |
+| fails no requests; `helm upgrade` of the operator early in a 40 s pause | promoted, the pause kept | 54.9 s / 54.7 s |
+
+- **The Lease handover** (from the old leader stopping, or being killed, to another process holding the Lease):
+
+  | | before the release (41858973662) | v1.0.0 (41861704300 / 41864997942) |
+  |---|---|---|
+  | `helm upgrade` (SIGTERM) | 15.1 s | 0.7 s / 1.4 s |
+  | SIGKILL | 17.6 s (the pod deleted with grace 0) | 16.3 s / 15.8 s |
+
+  On envtest (this Mac, three runs): a second operator led 54-55 ms after the first stopped, 15.9 s before the change
+  (`go test -run TestRunReleasesTheLeaseWhenStopped -v ./cmd/canary/` with `KUBEBUILDER_ASSETS` set).
+- **Capacity**: the two Deployments' ready pods, sampled every 100 ms, never went below `replicas` in any rollout of
+  any e2e run today (six, the crash and the upgrade included).
+- **The replica ratio as a traffic split**: the canary served 22.1% and 25.8% of the requests at the 25%
+  step (1 pod of 4), 51.9% and 47.0% at the 50% step.
+- **The ResourceQuota hold**, reproduced in every run: 30 s after a rollback from the 50% step the stable had 3 of 4
+  pods and the rolled-back canary served 35.7-42.6% of the requests (37.3% at `ca8f1ef`); the stable Deployment showed
+  `ReplicaFailure=True` (`FailedCreate`), the signal a fix would read ("Limitations").
+- **Locally** (Apple M3, macOS 26.6.2, on AC, nothing else running, at `ca8f1ef`): `make check` 56.21 s real
+  (`/usr/bin/time -p make check`), 166 top-level tests outside the e2e (`go test -list '.*' ./... | grep -c ^Test`; 142
+  on day 4) and 7 e2e tests; the schema property tests accepted 12,585 of 200,000 random URLs (2,725 bracketed) and
+  12,710 of 200,000 random timeouts, every one accepted by the operator's own checks (`go test -run Every -v
+  ./charts/` with `CANARY_HELM` set).
+
 ## Results (day 4)
 
 The end-to-end tests on kind in GitHub Actions (ubuntu-24.04, kind v0.33.0, Kubernetes 1.37.0, Prometheus 3.15.1),
