@@ -189,6 +189,62 @@ func TestRunElectsALeader(t *testing.T) {
 	}
 }
 
+// holderOf waits up to 30 seconds for the Lease in ns to be held by someone other than not (and not by nobody) and
+// returns the holder.
+func holderOf(t *testing.T, ns, not string) string {
+	t.Helper()
+	env := testenv.Get(t)
+	key := client.ObjectKey{Namespace: ns, Name: "canary.rollouts.vivekdavara.github.io"}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		var lease coordinationv1.Lease
+		err := env.Client.Get(context.Background(), key, &lease)
+		if err == nil && lease.Spec.HolderIdentity != nil && *lease.Spec.HolderIdentity != "" && *lease.Spec.HolderIdentity != not {
+			return *lease.Spec.HolderIdentity
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no new holder of the Lease after 30s: %v, %+v", err, lease.Spec)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A leader that is stopped (an upgrade, a drain, a scale-down: SIGTERM, then run's context cancelled) gives its Lease
+// up as it exits, so the next operator leads at once instead of waiting out the Lease's 15 seconds with nobody
+// reconciling (test/e2e's TestARolloutSurvivesAnOperatorUpgrade measures the same on kind). It is safe because run
+// returns, and the process ends, right after: nothing reconciles once the Lease is given up.
+func TestRunReleasesTheLeaseWhenStopped(t *testing.T) {
+	env := testenv.Get(t)
+	lockNS := env.Namespace(t)
+	env.BindLeaderElection(t, lockNS)
+	first := startRun(t, "--leader-elect", "--leader-election-namespace", lockNS)
+	holder := holderOf(t, lockNS, "")
+	if err := first.stop(t); err != nil {
+		t.Fatalf("run returned %v after cancel; want nil", err)
+	}
+	stopped := time.Now()
+	var lease coordinationv1.Lease
+	if err := env.Client.Get(context.Background(), client.ObjectKey{Namespace: lockNS, Name: "canary.rollouts.vivekdavara.github.io"}, &lease); err != nil {
+		t.Fatal(err)
+	}
+	if h := lease.Spec.HolderIdentity; h != nil && *h != "" {
+		t.Errorf("the stopped operator still holds the Lease (%s); it should have given it up", *h)
+	}
+
+	second := startRun(t, "--leader-elect", "--leader-election-namespace", lockNS)
+	next := holderOf(t, lockNS, holder)
+	took := time.Since(stopped)
+	t.Logf("the second operator took the Lease %v after the first stopped", took.Round(time.Millisecond))
+	// It tries at once when it starts; the Lease's duration (15s) would be the wait without the release.
+	if took > 5*time.Second {
+		t.Errorf("the second operator (%s) led %v after the first stopped; want well under the Lease's 15s", next, took)
+	}
+	createAndAwait(t, env.Namespace(t))
+	if err := second.stop(t); err != nil {
+		t.Errorf("run returned %v after cancel; want nil", err)
+	}
+}
+
 func TestRunRefusesUnknownFlags(t *testing.T) {
 	err := run(context.Background(), []string{"--no-such-flag"})
 	if err == nil || !strings.Contains(err.Error(), "no-such-flag") {

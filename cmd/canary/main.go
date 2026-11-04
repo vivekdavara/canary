@@ -87,7 +87,11 @@ func run(ctx context.Context, args []string) error {
 		LeaderElection:          *leaderElect,
 		LeaderElectionID:        "canary.rollouts.vivekdavara.github.io",
 		LeaderElectionNamespace: *leaderNamespace,
-		Controller:              config.Controller{SkipNameValidation: &skipNameValidation},
+		// A stopped leader (an upgrade, a drain: SIGTERM) gives the Lease up once its reconciles have ended, so another
+		// replica leads at once rather than after the Lease's 15 seconds. Safe because run returns, and the process
+		// ends, as soon as the manager has stopped: nothing reconciles after the release.
+		LeaderElectionReleaseOnCancel: true,
+		Controller:                    config.Controller{SkipNameValidation: &skipNameValidation},
 	})
 	if err != nil {
 		return fmt.Errorf("creating the manager: %w", err)
