@@ -42,9 +42,11 @@ rollout's `replicas` ready pods. Go 1.27, controller-runtime v0.25, Kubernetes 1
 
 - **Helm chart** (`charts/canary`): `helm install canary charts/canary -n canary-system --create-namespace --set
   prometheus.url=...`. The CRD and the ClusterRole's rules are copies of the generated files; values are checked by
-  a JSON schema; more than one replica requires leader election.
+  a JSON schema written to agree with the operator's own checks (property-tested); more than one replica requires
+  leader election; without it the operator is replaced with `Recreate`. Objects are named after the release.
 - **Kustomize** (`config/default`): `kubectl apply --server-side -k config/default`, the same objects.
-- The operator: two replicas with leader election, non-root, read-only root filesystem, no capabilities, liveness and
+- The operator: two replicas with leader election (a stopped leader gives the Lease up at once, so an upgrade or
+  drain doesn't pause reconciling for the Lease's 15 seconds; a crashed one is replaced when the Lease expires), non-root, read-only root filesystem, no capabilities, liveness and
   readiness probes, Prometheus metrics on `:8111`. The image (`make images`) is a static binary on distroless; no
   image is published.
 
@@ -55,8 +57,8 @@ rollout's `replicas` ready pods. Go 1.27, controller-runtime v0.25, Kubernetes 1
 - Seeded random walks of `Decide` (tens of thousands of rollouts with lost writes, deletions, edits, checks and
   deadlines) checking capacity after every decision.
 - End to end on kind in CI, with a real Prometheus and a demo app: a version promoted, one rolled back by measured
-  errors, one by the deadline, one promoted across the leader's pod being killed, and the ResourceQuota limitation
-  reproduced.
+  errors, one by the deadline, one promoted across the leader being killed (SIGKILL) and one across an operator
+  upgrade (`helm upgrade`), and the ResourceQuota limitation reproduced.
 
 ### Known limitations
 

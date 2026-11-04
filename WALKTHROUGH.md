@@ -473,7 +473,10 @@ everything back; a URL the operator refuses makes it exit at start, a crash loop
 the operator: the review found seven values they passed and the binary refused (`:9O90`, a space, an unclosed IPv6
 bracket, `%zz`, `0s`, `9999999h`, equal ports). Now the URL pattern is a subset of what `url.Parse` accepts, the
 duration pattern refuses zero and can't overflow, and a test runs the real binary with the arguments ten accepted
-values render, so the schema and the operator are checked to agree in both directions. The rules a schema can't say
+values render, so the schema and the operator are checked to agree in both directions. The second review round still
+found two gaps (IPv6 literals Go refuses, sub-nanosecond timeouts that truncate to 0), so the last word is a property
+test: the schema's own patterns, compiled in Go, against `analysis.NewPrometheus` and `time.ParseDuration` on 200,000
+random values each. The rules a schema can't say
 are `fail`s in the template: more than one replica without leader election, equal ports, a `podLabels` key the chart
 sets.
 
@@ -523,8 +526,10 @@ manager; one replica without leader election got a rolling update, which runs tw
 could override the selector's labels; `imagePullSecrets` took plain strings the API server refuses; and releases
 `foo` and `foo-canary` shared a ClusterRole name. Also ten mutants of the chart and of `config/manager` that every
 test let through, because the comparison test looked only at parts of the Deployment. All fixed, the comparison now
-covers whole objects, and each fix and survivor was re-run as a mutant. A second round reviewed the fixes and the
-Lease release (README, "Review of day 5").
+covers whole objects, and each fix and survivor was re-run as a mutant. A second round on the fixes found five more:
+switching an installed release to no leader election was refused (Helm 4's server-side apply kept the defaulted
+`rollingUpdate` next to `Recreate`), pull-secret names weren't quoted, and three schema gaps. As on days 2 and 3, the
+second round found bugs in the first round's fixes (README, "Review of day 5").
 
 **What went wrong on day 5?** My first schema patterns were written from what I thought the operator refused, not
 from its code, and only the review's "run the binary with the rendered arguments" test showed the gap. My first

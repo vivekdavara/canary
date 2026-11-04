@@ -93,6 +93,7 @@ The full example is [config/samples/web.yaml](config/samples/web.yaml) (a test a
 | `charts/canary/` | the Helm chart installing the same objects; `crds/` and `files/role.yaml` are copies of the generated files (`make manifests`) |
 | `charts/chart_test.go` | the chart's tests: rendered against `config/default`, the values it refuses, `helm install`/upgrade/uninstall on envtest |
 | `charts/review_d5_*_test.go` | the day 5 review's findings, as it wrote them (two assertions adapted to the fixes: the chart refuses a selector label in `podLabels`; the CRD upgrade test runs the corrected command and an install after it), and the schema checked against the real binary both ways: the values it refuses exit the operator, ten it accepts start it |
+| `charts/review_d5b_values_test.go`, `charts/schema_property_test.go` | the second review round's findings (an upgrade switching leader election off, pull-secret names, IPv6 literals, sub-nanosecond timeouts, a URL ending in `:`), and the schema's own patterns, compiled in Go, against the operator's checks: 200,000 random URLs and 200,000 random timeouts, every accepted one accepted by `analysis.NewPrometheus` and `time.ParseDuration` (> 0), samples cross-checked through helm |
 | `config/samples/` | example rollouts |
 | `internal/revision/` | a template's revision: 16 hex digits of the SHA-256 of its JSON |
 | `internal/rollout/` | the pod split and the state machine (`Decide`: steps, pauses, checks, the deadline, rollback), pure functions |
@@ -196,7 +197,7 @@ play its part: they write a Deployment's status (`markReady`) when its pods woul
 | `internal/controller/canaryrollout_controller_test.go` | status follows the spec through template and replica changes; fields the reconciler doesn't own are kept; a missing rollout is no error |
 | `cmd/canary/main_test.go` | the binary from its flags and a kubeconfig: probes answer, a rollout is reconciled, the reconcile is counted in its metrics, a clean stop; with `--leader-elect` it takes the Lease using only the leader-election Role, and gives it up when stopped (a second operator leads within 5 s; 15.9 s before day 5's fix); `--help`; bad `--prometheus-url` and `--analysis-timeout` values refused with the flag named |
 | `config/install_test.go` | the README's install steps with envtest's kubectl: client-side apply of the CRD fails ("Too long"), `--server-side` works, the sample applies, `kubectl get crl` shows the columns; `config/default` applies, and `kubectl auth can-i` as its service account shows what it may do and what not (delete Deployments, read Secrets, take a Lease outside `canary-system`); the e2e tests' Prometheus applies |
-| `charts/chart_test.go` | the Helm chart with the pinned helm: a release named `canary` renders `config/default`'s objects (same names, CRD spec, rules, role references, subjects, replicas and pod spec); its `crds/` and `files/role.yaml` are byte copies of the generated files; names per release; one replica without leader election has no Lease role; eleven values refused, each with its message; the notes warn without `prometheus.url`; `helm install` on an API server without the CRD (the chart's served, the account's permissions as `config/default`'s), an upgrade, an uninstall keeping the CRD and a rollout |
+| `charts/chart_test.go` | the Helm chart with the pinned helm: a release named `canary` renders `config/default`'s objects (same names, CRD spec, rules, role references, subjects, replicas and pod spec); its `crds/` and `files/role.yaml` are byte copies of the generated files; names per release; one replica without leader election has no Lease role and is replaced with `Recreate`, two with a one-at-a-time rolling update; 23 values refused, each with its message; one port set alone; every pod value where it lands; every namespaced object in the release's namespace; the notes warn without `prometheus.url`; `helm install` on an API server without the CRD (the chart's served, the account's permissions as `config/default`'s), an upgrade, an uninstall keeping the CRD and a rollout |
 | `test/e2e/demoapp/main_test.go` (unit) | the demo app: the failure schedule (any n consecutive requests fail floor or ceil of n * ratio), the exposition (both codes from the start), the probes, the config refusing bad values, a clean stop, the load generator's rate and one connection per request |
 | `test/e2e/e2e_test.go` (kind, CI; the operator installed by the chart) | DESIGN "End to end": a good version promoted, a bad one rolled back on measured error rates, one that never becomes ready rolled back at the deadline, one promoted across the leader's process being killed (SIGKILL) mid-pause and one across a `helm upgrade` of the operator mid-pause (the pause kept in both), capacity sampled every 100 ms throughout; the Prometheus client against a real Prometheus |
 
@@ -447,6 +448,17 @@ namespaces, ignored tolerations and `podLabels`, the naming rule, `config/manage
 `config/default` now covers the whole Deployment spec and ServiceAccount, a render in another namespace checks every
 namespaced object and subject, and every pod value is checked where it lands. Each fix and each survivor was re-run
 as a mutant here and fails a test.
+
+A second agent, on the fixes (`5586d5f`, about 10 minutes, `charts/review_d5b_values_test.go`), found five defects
+in them, all fixed in `ca8f1ef`: **`helm upgrade` to no leader election was refused** (Helm 4 applies server-side,
+and the API server's defaulted `rollingUpdate` stayed next to `Recreate`; the strategy is now always written out);
+**pull-secret names were rendered unquoted** (`123`, `yes`, `1e3` broke the install); the IPv6 branch accepted
+literals `url.Parse` refuses (`[1]`, `[:]`, nine groups); sub-nanosecond timeouts (`0.5ns`) parse to 0; a URL ending
+in `:` became a YAML mapping (arguments are quoted now). Its four surviving mutants have tests, and
+`schema_property_test.go` now checks the schema's patterns against the operator's own checks on 200,000 random
+values each. Each fix was re-run as a mutant and fails a test. It read the Lease release as safe: reconciles get a
+cancelled context at the stop, and a check cut short is no verdict, so the next leader checks again. Unverified, from
+its reading: Events queued at the stop may be dropped (the recorder is stopped with an expired context).
 
 Found by me the same day: a stopped leader kept its Lease for its full 15 s, so every upgrade or drain paused all
 rollouts that long (fixed in `98636c3`: 15.9 s to 54-55 ms on envtest, 15.1 s to 0.7 s on kind); that fix made the

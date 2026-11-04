@@ -530,18 +530,26 @@ flowchart LR
   refuses unknown keys (a misspelt `prometheusUrl` would otherwise be ignored silently, and every check would fail
   closed) and `replicaCount` below 1. The Prometheus URL must match a subset of what the operator's own check
   (`url.Parse`, then no user, query or fragment) accepts: `http` or `https`, a host name or a bracketed IPv6 address,
-  a port of digits, a path of unreserved characters and well-formed `%`-escapes. The timeout must be a positive Go
-  duration with numbers of at most five digits, at most seven of them, so it can't overflow. A value the operator
+  a port of digits, a path of unreserved characters and well-formed `%`-escapes; a bracketed address must be one of
+  RFC 4291's text forms (no zone, no embedded IPv4), as `url.Parse` checks them with `netip`. The timeout must be a Go
+  duration of one to seven parts, numbers of at most five digits and nine decimals (so it can't overflow), with at
+  least one part of a millisecond or more on its own (`0s`, `0.5ns`, `500us` are refused: `time.ParseDuration`
+  truncates below a nanosecond, and a sub-millisecond query timeout is no use). A value the operator
   refuses at start would otherwise pass the install and crash-loop the pod. The rules a schema can't state fail the
   render: more than one replica without leader election (both replicas would reconcile and write over each other's
   decisions), the same port for metrics and probes, and a `podLabels` key the chart sets itself (the selector's
   labels: an override would detach the pods from their Deployment). Both directions are tested: each value the review
   found is refused, and ten accepted values, the unusual ones too (an IPv6 address, an escaped path, `25000µs`, the
-  largest timeout the pattern allows), start the real binary against envtest.
+  largest timeout the pattern allows), start the real binary against envtest; and `schema_property_test.go` compiles
+  the schema's own patterns and checks that each of 200,000 random URLs and 200,000 random timeouts they accept is
+  accepted by the operator's own checks (the second review round found five more gaps, below).
 - **Without leader election the pod is replaced by stopping the old one first** (`strategy: Recreate`). A rolling
-  update starts the new pod beside the old one, and with no Lease both would reconcile. With leader election the
-  default rolling update is right: the new pod waits for the Lease, which the old one gives up as it stops ("Leader
-  election", below).
+  update starts the new pod beside the old one, and with no Lease both would reconcile. With leader election a rolling
+  update one pod at a time with none unavailable is right: the new pod waits for the Lease, which the old one gives up
+  as it stops ("Leader election", below). The strategy is written out in both cases (and in `config/manager`): Helm 4
+  applies server-side, and a `rollingUpdate` the API server had defaulted would stay beside `Recreate` and get the
+  upgrade refused; one the chart applied is removed when the chart stops applying it.
+- **Every templated argument is quoted**: a URL's path may end in `:`, which YAML would read as a mapping.
 - **Objects are named exactly after the release** (`-manager` for the cluster-wide role and binding,
   `-leader-election` for the Lease's), so two releases never share a name. The first version appended `-canary` to a
   release that didn't say canary, and the review found `foo` and `foo-canary` sharing a ClusterRole. One operator per
