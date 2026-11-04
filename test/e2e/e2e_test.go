@@ -765,6 +765,15 @@ func TestATightQuotaHoldsARollbackWithTheCanaryServing(t *testing.T) {
 	if !strings.Contains(why, "exceeded quota") {
 		t.Errorf("the stable's ReplicaSets show no quota failure: %q", why)
 	}
+	// Whether the Deployment itself says so (the Deployment controller copies a ReplicaSet's ReplicaFailure onto its
+	// Deployment when it syncs a rollout's status, not when it only scales): the signal a fix would read without
+	// watching ReplicaSets (README, "Limitations"). Reported, not asserted.
+	onDeployment := "no ReplicaFailure condition"
+	for _, c := range stable.Status.Conditions {
+		if c.Type == appsv1.DeploymentReplicaFailure {
+			onDeployment = fmt.Sprintf("ReplicaFailure=%s (%s)", c.Status, c.Reason)
+		}
+	}
 	share, err := w.canaryShare()
 	if err != nil {
 		t.Fatal(err)
@@ -772,8 +781,8 @@ func TestATightQuotaHoldsARollbackWithTheCanaryServing(t *testing.T) {
 	if fewest := w.fewestReady(); fewest < replicas {
 		t.Errorf("the ready pods went down to %d of %d", fewest, replicas)
 	}
-	w.result("%.0fs after the rollback: stable %d of %d ready, the rolled-back canary still at %d ready pods serving %.1f%% of the requests; the stable's ReplicaSet: %.120s",
-		held.Seconds(), stable.Status.ReadyReplicas, replicas, canary.Status.ReadyReplicas, 100*share, why)
+	w.result("%.0fs after the rollback: stable %d of %d ready, the rolled-back canary still at %d ready pods serving %.1f%% of the requests; the stable's ReplicaSet: %.120s; the stable Deployment: %s",
+		held.Seconds(), stable.Status.ReadyReplicas, replicas, canary.Status.ReadyReplicas, 100*share, why, onDeployment)
 }
 
 // The analysis client (internal/analysis/prometheus.go) against a real Prometheus: the unit tests use canned
