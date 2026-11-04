@@ -92,6 +92,7 @@ The full example is [config/samples/web.yaml](config/samples/web.yaml) (a test a
 | `config/default/` | the kustomization installing all of it: `kubectl apply --server-side -k config/default` |
 | `charts/canary/` | the Helm chart installing the same objects; `crds/` and `files/role.yaml` are copies of the generated files (`make manifests`) |
 | `charts/chart_test.go` | the chart's tests: rendered against `config/default`, the values it refuses, `helm install`/upgrade/uninstall on envtest |
+| `charts/review_d5_*_test.go` | the day 5 review's findings, as it wrote them (two assertions adapted to the fixes: the chart refuses a selector label in `podLabels`; the CRD upgrade test runs the corrected command and an install after it), and the schema checked against the real binary both ways: the values it refuses exit the operator, ten it accepts start it |
 | `config/samples/` | example rollouts |
 | `internal/revision/` | a template's revision: 16 hex digits of the SHA-256 of its JSON |
 | `internal/rollout/` | the pod split and the state machine (`Decide`: steps, pauses, checks, the deadline, rollback), pure functions |
@@ -193,11 +194,11 @@ play its part: they write a Deployment's status (`markReady`) when its pods woul
 | `internal/controller/rollout_test.go` (`TestARolloutsWrites`) | a whole rollout's writes counted at the operator's own client, and none in the two seconds after it ends: a guard against a reconcile that writes in a loop (a status carrying the time wrote 984 patches in those two seconds) |
 | `internal/controller/reconcile_test.go` | `Reconcile` called by hand through an interceptor client: a status computed from a spec that changed before the patch is refused (the optimistic lock); a reconcile with nothing new writes nothing; a second operator (fixed clocks, ten minutes apart) keeps a paused step's start time |
 | `internal/controller/canaryrollout_controller_test.go` | status follows the spec through template and replica changes; fields the reconciler doesn't own are kept; a missing rollout is no error |
-| `cmd/canary/main_test.go` | the binary from its flags and a kubeconfig: probes answer, a rollout is reconciled, the reconcile is counted in its metrics, a clean stop; with `--leader-elect` it takes the Lease using only the leader-election Role; `--help`; bad `--prometheus-url` and `--analysis-timeout` values refused with the flag named |
+| `cmd/canary/main_test.go` | the binary from its flags and a kubeconfig: probes answer, a rollout is reconciled, the reconcile is counted in its metrics, a clean stop; with `--leader-elect` it takes the Lease using only the leader-election Role, and gives it up when stopped (a second operator leads within 5 s; 15.9 s before day 5's fix); `--help`; bad `--prometheus-url` and `--analysis-timeout` values refused with the flag named |
 | `config/install_test.go` | the README's install steps with envtest's kubectl: client-side apply of the CRD fails ("Too long"), `--server-side` works, the sample applies, `kubectl get crl` shows the columns; `config/default` applies, and `kubectl auth can-i` as its service account shows what it may do and what not (delete Deployments, read Secrets, take a Lease outside `canary-system`); the e2e tests' Prometheus applies |
 | `charts/chart_test.go` | the Helm chart with the pinned helm: a release named `canary` renders `config/default`'s objects (same names, CRD spec, rules, role references, subjects, replicas and pod spec); its `crds/` and `files/role.yaml` are byte copies of the generated files; names per release; one replica without leader election has no Lease role; eleven values refused, each with its message; the notes warn without `prometheus.url`; `helm install` on an API server without the CRD (the chart's served, the account's permissions as `config/default`'s), an upgrade, an uninstall keeping the CRD and a rollout |
 | `test/e2e/demoapp/main_test.go` (unit) | the demo app: the failure schedule (any n consecutive requests fail floor or ceil of n * ratio), the exposition (both codes from the start), the probes, the config refusing bad values, a clean stop, the load generator's rate and one connection per request |
-| `test/e2e/e2e_test.go` (kind, CI; the operator installed by the chart) | DESIGN "End to end": a good version promoted, a bad one rolled back on measured error rates, one that never becomes ready rolled back at the deadline, one promoted across the leader's pod being killed mid-pause (the pause kept), capacity sampled every 100 ms throughout; the Prometheus client against a real Prometheus |
+| `test/e2e/e2e_test.go` (kind, CI; the operator installed by the chart) | DESIGN "End to end": a good version promoted, a bad one rolled back on measured error rates, one that never becomes ready rolled back at the deadline, one promoted across the leader's process being killed (SIGKILL) mid-pause and one across a `helm upgrade` of the operator mid-pause (the pause kept in both), capacity sampled every 100 ms throughout; the Prometheus client against a real Prometheus |
 
 Checks that the tests can fail, each run as a mutant. Day 5: a writable root filesystem in the chart's Deployment, an
 extra verb in its Lease role, and its ClusterRoleBinding's subject in another namespace each fail
@@ -421,6 +422,37 @@ Removing half of the second fix survived its test, so a third test covers that h
 tests (the refused-rewrite fallback, falling back on any error, upper-casing in the early check) each have a test now
 (`7d8096a`). Each test fails before its fix or on its mutant; I re-ran them all here. Not tested, by the agent's
 reading: a status-write conflict right after the stable is recreated loses that check's Event and condition for good.
+
+## Review of day 5
+
+One review agent at `0cca340` (the chart, about 11 minutes, its own worktree, findings as failing tests, kept as
+`charts/review_d5_*_test.go`) reproduced six defects, all fixed in `983e52c`:
+
+- **Medium: the schema let through values the operator exits on at start** (a crash loop in a cluster): Prometheus
+  URLs `url.Parse` refuses (`:9O90`, a space in the host, an unclosed IPv6 bracket, `%zz`), `analysisTimeout` `0s` and
+  `9999999h`, and the same port for metrics and probes. The patterns now follow the operator's own checks, equal
+  ports fail the render, and `TestValuesTheSchemaAcceptsStartTheOperator` runs the real binary with what ten accepted
+  values render.
+- **Medium: the documented CRD upgrade command failed** (`conflict with "helm": .spec.versions`): Helm 4 applies
+  `crds/` server-side. My first fix, `--force-conflicts`, made the next `helm install` conflict with `kubectl`; the
+  command is now `--field-manager=helm`, and the test runs an install after it.
+- **Medium: one replica without leader election had a rolling update**, which runs the old and new operator at once,
+  both reconciling: `strategy: Recreate` now.
+- Low: `podLabels` could override the selector's labels (refused by the chart now); `imagePullSecrets` took strings
+  the API server refuses (both forms accepted now); releases `foo` and `foo-canary` shared a ClusterRole (objects are
+  named exactly after the release now).
+
+It also listed ten mutants every test let through (no token on the account, a paused Deployment, hard-coded
+namespaces, ignored tolerations and `podLabels`, the naming rule, `config/manager` drifting): the comparison with
+`config/default` now covers the whole Deployment spec and ServiceAccount, a render in another namespace checks every
+namespaced object and subject, and every pod value is checked where it lands. Each fix and each survivor was re-run
+as a mutant here and fails a test.
+
+Found by me the same day: a stopped leader kept its Lease for its full 15 s, so every upgrade or drain paused all
+rollouts that long (fixed in `98636c3`: 15.9 s to 54-55 ms on envtest, 15.1 s to 0.7 s on kind); that fix made the
+e2e crash test a clean stop (the kubelet sends SIGTERM even for a pod deleted with grace 0), so it now SIGKILLs the
+container (`5586d5f`); and `TestAFailingAnalysisRollsBack` raced the asynchronous Event recorder once in CI
+(`10b3cc2`).
 
 ## What went wrong on day 3
 
