@@ -16,6 +16,13 @@ metadata:
     app.kubernetes.io/name: canary
 spec:
   replicas: 2
+  # One new pod at a time and never one fewer ready: the new pod waits for the Lease, which the old one gives up as it
+  # stops (the chart writes the same).
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app.kubernetes.io/name: canary

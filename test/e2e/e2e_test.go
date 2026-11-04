@@ -642,9 +642,10 @@ var kindNode = envOr("CANARY_E2E_NODE", "canary-e2e-control-plane")
 
 // The leader crashes mid-step: its process is killed with SIGKILL through the node's container runtime (crictl), so
 // it can't give the Lease up. (Day 4 deleted its pod with no grace period, but the kubelet still sends SIGTERM first,
-// and since day 5 the operator answers that by releasing the Lease: that's the upgrade test's case now.) The other
-// replica takes the Lease when it expires, carries the step on from the status (the pause isn't restarted) and
-// promotes, and the ready pods never go below replicas. The killed container restarts in the same pod, so the holder
+// and since day 5 the operator answers that by releasing the Lease: that's the upgrade test's case now.) Another
+// process takes the Lease when it expires (the other replica, or the killed container restarted: either has a new
+// identity), carries the step on from the status (the pause isn't restarted) and promotes, and the ready pods never go
+// below replicas. The killed container restarts in the same pod, so the holder
 // is compared by identity (a new process has a new UUID), not by pod. Not parallel, so the handover doesn't hold up
 // the other tests' rollouts and timings.
 func TestARolloutSurvivesTheLeaderCrashing(t *testing.T) {

@@ -89,7 +89,9 @@ func run(ctx context.Context, args []string) error {
 		LeaderElectionNamespace: *leaderNamespace,
 		// A stopped leader (an upgrade, a drain: SIGTERM) gives the Lease up once its reconciles have ended, so another
 		// replica leads at once rather than after the Lease's 15 seconds. Safe because run returns, and the process
-		// ends, as soon as the manager has stopped: nothing reconciles after the release.
+		// ends, as soon as the manager has stopped. The exception: a reconcile still running at the manager's 30 s
+		// graceful-shutdown timeout, when the Lease is given up anyway (reconciles get a cancelled context at the stop,
+		// and a check cut short is no verdict, so this needs a write hanging that long; DESIGN.md, "Leader election").
 		LeaderElectionReleaseOnCancel: true,
 		Controller:                    config.Controller{SkipNameValidation: &skipNameValidation},
 	})

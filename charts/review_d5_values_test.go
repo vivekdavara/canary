@@ -92,7 +92,7 @@ func TestValuesTheSchemaAcceptsStartTheOperator(t *testing.T) {
 		{"an escape in the path", []string{"prometheus.url=http://p:9090/a%2Fb"}},
 		{"a timeout in two units", []string{"analysisTimeout=1m30s"}},
 		{"a fractional timeout", []string{"analysisTimeout=0.5s"}},
-		{"a timeout in microseconds", []string{"analysisTimeout=25000µs"}},
+		{"a timeout with a microsecond part", []string{"analysisTimeout=1s25000µs"}},
 		{"the largest timeout the pattern allows", []string{"analysisTimeout=99999h99999h99999h99999h99999h99999h99999h"}},
 		{"one replica without leader election", []string{"replicaCount=1", "leaderElection.enabled=false"}},
 	} {

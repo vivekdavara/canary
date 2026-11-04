@@ -312,9 +312,11 @@ func TestTheChartsNamesAndLeaderElection(t *testing.T) {
 	if typ := field(t, dep, "spec", "strategy", "type"); typ != "Recreate" {
 		t.Errorf("strategy %v without leader election, want Recreate", typ)
 	}
-	// With leader election the default rolling update is right: the new pod waits for the Lease.
-	if _, ok := byKey(render(t, "canary"))["Deployment/canary-system/canary"].Object["spec"].(map[string]any)["strategy"]; ok {
-		t.Error("a strategy is rendered with leader election")
+	// With leader election a rolling update one pod at a time, never one fewer ready: the new pod waits for the Lease.
+	// Written out, so an upgrade can switch to Recreate (review_d5b_values_test.go).
+	want := map[string]any{"type": "RollingUpdate", "rollingUpdate": map[string]any{"maxSurge": float64(1), "maxUnavailable": float64(0)}}
+	if got := field(t, byKey(render(t, "canary"))["Deployment/canary-system/canary"], "spec", "strategy"); !reflect.DeepEqual(got, want) {
+		t.Errorf("strategy %v with leader election, want %v", got, want)
 	}
 }
 
@@ -345,6 +347,9 @@ func TestTheChartRefusesBadValues(t *testing.T) {
 		{[]string{`podLabels.app\.kubernetes\.io/instance=x`}, "podLabels can't set app.kubernetes.io/instance"},
 		{[]string{`podLabels.helm\.sh/chart=x`}, "podLabels can't set helm.sh/chart"},
 		{[]string{"imagePullSecrets[0].secret=regcred"}, "at '/imagePullSecrets/0'"},
+		{[]string{"imagePullSecrets[0].name=regcred", "imagePullSecrets[0].namespace=x"}, "at '/imagePullSecrets/0'"},
+		{[]string{"imagePullSecrets[0]="}, "at '/imagePullSecrets/0'"},
+		{[]string{"imagePullSecrets[0]=null"}, "at '/imagePullSecrets/0'"},
 	} {
 		args := []string{"template", "canary", "./canary"}
 		for _, s := range c.set {
@@ -355,6 +360,16 @@ func TestTheChartRefusesBadValues(t *testing.T) {
 			t.Errorf("--set %v rendered", c.set)
 		} else if !strings.Contains(stderr, c.want) {
 			t.Errorf("--set %v failed without %q: %s", c.set, c.want, stderr)
+		}
+	}
+}
+
+// One port set on its own still renders: --set gives an int64, the values file a float64, and the template's
+// equality check compares them as ints.
+func TestOnePortSetAlone(t *testing.T) {
+	for _, set := range []string{"metricsPort=9000", "probesPort=9001"} {
+		if _, stderr, err := helm(t, "template", "canary", "./canary", "--set", set); err != nil {
+			t.Errorf("--set %s: %v: %s", set, err, stderr)
 		}
 	}
 }

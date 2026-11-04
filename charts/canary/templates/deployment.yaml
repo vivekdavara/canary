@@ -20,10 +20,19 @@ metadata:
     {{- include "canary.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
-  {{- if not .Values.leaderElection.enabled }}
-  # Without leader election nothing stops two operators reconciling at once, and a rolling update runs the new pod
-  # beside the old one: the old one stops first instead. (With leader election the new pod waits for the Lease.)
+  # Written out either way, so a helm upgrade can switch between them: Helm 4 applies server-side, and a rollingUpdate
+  # the API server defaulted would stay and be refused next to Recreate; one the chart applied is removed with it.
   strategy:
+  {{- if .Values.leaderElection.enabled }}
+    # One new pod at a time and never one fewer ready: the new pod waits for the Lease, which the old one gives up
+    # as it stops.
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  {{- else }}
+    # Without leader election nothing stops two operators reconciling at once, and a rolling update runs the new pod
+    # beside the old one: the old one stops first instead.
     type: Recreate
   {{- end }}
   selector:
@@ -45,7 +54,10 @@ spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- range . }}
-        - name: {{ if kindIs "string" . }}{{ . }}{{ else }}{{ .name }}{{ end }}
+        {{- $name := "" }}
+        {{- if kindIs "map" . }}{{ $name = .name }}{{ else if not (kindIs "invalid" .) }}{{ $name = toString . }}{{ end }}
+        {{- if not $name }}{{ fail "imagePullSecrets: each item is a Secret's name, or {name: ...}" }}{{ end }}
+        - name: {{ $name | quote }}
         {{- end }}
       {{- end }}
       securityContext:
@@ -56,16 +68,17 @@ spec:
         - name: canary
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Quoted: a value can end in ":" (a URL's path may), which YAML would read as a mapping.
           args:
             {{- if .Values.leaderElection.enabled }}
             - --leader-elect
             {{- end }}
-            - --metrics-bind-address=:{{ .Values.metricsPort }}
-            - --health-probe-bind-address=:{{ .Values.probesPort }}
+            - {{ printf "--metrics-bind-address=:%v" .Values.metricsPort | quote }}
+            - {{ printf "--health-probe-bind-address=:%v" .Values.probesPort | quote }}
             {{- with .Values.prometheus.url }}
-            - --prometheus-url={{ . }}
+            - {{ printf "--prometheus-url=%s" . | quote }}
             {{- end }}
-            - --analysis-timeout={{ .Values.analysisTimeout }}
+            - {{ printf "--analysis-timeout=%s" .Values.analysisTimeout | quote }}
           ports:
             - name: metrics
               containerPort: {{ .Values.metricsPort }}

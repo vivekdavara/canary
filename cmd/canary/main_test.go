@@ -211,8 +211,9 @@ func holderOf(t *testing.T, ns, not string) string {
 
 // A leader that is stopped (an upgrade, a drain, a scale-down: SIGTERM, then run's context cancelled) gives its Lease
 // up as it exits, so the next operator leads at once instead of waiting out the Lease's 15 seconds with nobody
-// reconciling (test/e2e's TestARolloutSurvivesAnOperatorUpgrade measures the same on kind). It is safe because run
-// returns, and the process ends, right after: nothing reconciles once the Lease is given up.
+// reconciling (test/e2e's TestARolloutSurvivesAnOperatorUpgrade measures the same on kind). It is safe because the
+// Lease is given up after the reconcilers stop, and run returns, ending the process, right after (DESIGN.md, "Leader
+// election", for the shutdown-timeout exception).
 func TestRunReleasesTheLeaseWhenStopped(t *testing.T) {
 	env := testenv.Get(t)
 	lockNS := env.Namespace(t)
