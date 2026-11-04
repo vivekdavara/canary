@@ -437,13 +437,13 @@ Rules, and why:
 
 envtest has no pods: its Deployments never get any, and the tests set their status by hand. The end-to-end tests
 (`test/e2e`, build tag `e2e`) run the operator on a real cluster instead, kind in CI, where a real Deployment
-controller starts real pods, a real Prometheus scrapes them, and the operator, installed from its image by
-`config/default`, decides on what Prometheus measured.
+controller starts real pods, a real Prometheus scrapes them, and the operator, installed from its image by its Helm
+chart (day 5; `config/default` on day 4), decides on what Prometheus measured.
 
 ```mermaid
 flowchart LR
   subgraph kind["kind cluster (CI)"]
-    op["canary operator<br/>2 replicas, leader election<br/>(config/default)"]
+    op["canary operator<br/>2 replicas, leader election<br/>(helm install charts/canary)"]
     prom[("Prometheus<br/>pod discovery, 2s scrapes")]
     subgraph ns["a test's namespace"]
       load["load generator<br/>40 requests/s,<br/>a new connection each"] --> svc["Service good<br/>app=good"]
@@ -468,8 +468,8 @@ flowchart LR
   named `metrics` every 2 seconds, keeping the operator's pod labels as `rollout`, `track` and `revision`, so a query
   selects `track="canary"` as the sample's do. It scrapes the operator too. `test/e2e/kind.yaml` publishes its NodePort
   on the runner's `127.0.0.1:9090` for the tests' own queries.
-- **The operator** runs as `config/default` installs it (two replicas, leader election, the generated ClusterRole bound
-  to its service account), with `--prometheus-url` added by `test/e2e/config`.
+- **The operator** runs as the chart installs it by default (two replicas, leader election, the generated ClusterRole
+  bound to its service account), with `--set prometheus.url` pointing it at that Prometheus (`make e2e-install`).
 
 Each test gets its own namespace, a Service, a load generator, and a rollout with an error-rate metric (the canary's
 500s over all its requests, over 20 seconds, at most 0.05), checked every 5 seconds, tolerating two failed checks a step
@@ -492,6 +492,57 @@ nothing about the data), a warning (it fails: the answer may be wrong) and a par
 `make e2e` runs it all on any machine with Docker and kind (`make e2e-down` deletes the cluster); CI runs it on every
 push (`.github/workflows/ci.yml`, the `e2e` job). Not covered: several nodes, a leader that hangs rather than crashes
 (it keeps the Lease until its renewals fail), and traffic through a mesh.
+
+## Installing it (day 5)
+
+Two ways, the same objects: a Helm chart (`charts/canary`) and a kustomization (`config/default`). Both install the
+CRD, a service account, the generated ClusterRole bound to it cluster-wide (rollouts can be in any namespace), the
+leader-election Role in the operator's namespace (the Lease and its Events), and the operator's Deployment.
+
+```mermaid
+flowchart LR
+  types["api/v1alpha1 types<br/>+ markers"] -- "make manifests<br/>(controller-gen)" --> crd["config/crd/bases<br/>CRD"]
+  markers["reconciler's<br/>rbac markers"] -- "make manifests" --> role["config/rbac/role.yaml"]
+  crd -- "cp" --> ccrd["charts/canary/crds/"]
+  role -- "cp" --> crole["charts/canary/files/role.yaml"]
+  crd --> kust["config/default<br/>(kustomize)"]
+  role --> kust
+  ccrd --> chart["charts/canary<br/>(helm)"]
+  crole -- ".Files.Get | fromYaml" --> chart
+```
+
+- **Nothing is written twice.** The CRD and the ClusterRole's rules come from the code (controller-gen), and the chart
+  holds copies of those two files, because Helm reads only files inside a chart. `make manifests` makes the copies,
+  and CI's generated-files check fails a commit whose copies are stale. The ClusterRole template takes its rules from
+  the copied file (`.Files.Get "files/role.yaml" | fromYaml`), so a new rbac marker reaches the chart with no edit.
+- **The chart and `config/default` are checked against each other.** `TestTheChartInstallsWhatConfigDefaultDoes`
+  renders both and compares them object by object: the same kinds and names (for a release named `canary` in
+  `canary-system`), the same CRD spec, rules, role references and subjects, the same replicas and pod spec. The
+  differences are the chart's own: the namespace comes from `helm install --create-namespace`, the objects carry
+  Helm's labels (the selector also the release's instance, so two releases' pods don't mix), and the operator gets
+  `--analysis-timeout` spelled out. An edit to one that isn't made to the other fails it.
+- **The values are checked before anything is installed.** `values.schema.json` refuses unknown keys (a misspelt
+  `prometheusUrl` would otherwise be ignored silently, and every check would fail closed), `replicaCount` below 1, a
+  Prometheus URL with a user, query or fragment (the operator would refuse it at start, in a crash loop), a timeout
+  that isn't a duration, and ports out of range. More than one replica without leader election fails the render:
+  both replicas would reconcile, and write over each other's decisions.
+- **Names follow the release**: `<release>` if it says canary, else `<release>-canary`, and `-manager` for the
+  cluster-wide role and binding, so two releases don't fight over a ClusterRole. One operator per cluster is still the
+  rule: the Lease is per namespace, so two releases in different namespaces would both reconcile every rollout.
+- **The CRD is in `crds/`**, which Helm installs before the templates and never upgrades or deletes. Never deleting
+  it is the point: deleting a CRD deletes every rollout in it, and with them (by owner references) every application's
+  Deployments; uninstalling the operator leaves the rollouts and their pods running, unmanaged. Not upgrading it means
+  a release that changes the CRD needs `kubectl apply --server-side -f charts/canary/crds/` before `helm upgrade`.
+- **There is no published image.** The chart's default image is `canary:dev`, what `make images` builds and what the
+  end-to-end tests load into kind; a cluster that pulls from a registry needs `--set image.repository=... --set
+  image.tag=...`.
+- **Helm is pinned** (v4.3.1) and built into `bin/` by `go install`, like controller-gen and setup-envtest, so a check
+  doesn't depend on what is installed on the machine.
+
+The chart's tests (`charts/chart_test.go`) also install it for real on envtest's API server, started for that package
+without the CRD so the chart's own is the one served: the operator's account may do what `config/default`'s may and
+nothing more (the same `kubectl auth can-i` table), an upgrade changes an argument, and an uninstall removes the
+operator and keeps the CRD and a rollout in it. The end-to-end tests install the operator on kind with the chart.
 
 ## Testing
 
