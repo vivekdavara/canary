@@ -761,31 +761,7 @@ func TestARolloutSurvivesAnOperatorUpgrade(t *testing.T) {
 	}
 	upgraded := time.Now()
 	t.Logf("+%5.1fs upgraded the operator; the leader is %s", time.Since(w.start).Seconds(), leader)
-
-	// The leader's pod is told to stop when its deletion timestamp is set (or it is already gone).
-	var stopped time.Time
-	for {
-		var pod corev1.Pod
-		err := k8s.Get(context.Background(), client.ObjectKey{Namespace: "canary-system", Name: leader}, &pod)
-		if apierrors.IsNotFound(err) || (err == nil && pod.DeletionTimestamp != nil) {
-			stopped = time.Now()
-			break
-		}
-		if time.Since(upgraded) > 3*time.Minute {
-			t.Fatalf("the old leader's pod wasn't stopped within 3 minutes of the upgrade (%v)", err)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	t.Logf("+%5.1fs the old leader's pod is stopping", time.Since(w.start).Seconds())
-	var next string
-	for next = leaderPod(t); next == "" || next == leader; next = leaderPod(t) {
-		if time.Since(stopped) > time.Minute {
-			t.Fatal("no new leader a minute after the old one was told to stop")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	handover := time.Since(stopped)
-	t.Logf("+%5.1fs %s took the Lease", time.Since(w.start).Seconds(), next)
+	gaps := watchLeadersUntilRolledOut(t, w, upgraded)
 
 	final := w.waitFor(3*time.Minute, "the promotion", func(ro *v1.CanaryRollout) bool {
 		s := ro.Status
@@ -812,8 +788,63 @@ func TestARolloutSurvivesAnOperatorUpgrade(t *testing.T) {
 	if final.Status.StableRevision != rev {
 		t.Errorf("stable revision %q, want %q", final.Status.StableRevision, rev)
 	}
-	w.result("the old leader's pod was told to stop %.1fs after helm upgrade, and another took the Lease %.1fs after that; promoted %.1fs after the template changed, the first pause kept; fewest ready pods %d of %d",
-		stopped.Sub(upgraded).Seconds(), handover.Seconds(), took.Seconds(), w.fewestReady(), replicas)
+	longest := time.Duration(0)
+	for _, g := range gaps {
+		longest = max(longest, g)
+	}
+	w.result("%d handovers while the operator's pods were replaced, the longest %.1fs with no running leader (all: %v); promoted %.1fs after the template changed, the first pause kept; fewest ready pods %d of %d",
+		len(gaps), longest.Seconds(), gaps, took.Seconds(), w.fewestReady(), replicas)
+}
+
+// watchLeadersUntilRolledOut samples the Lease and its holder's pod every 100 ms from the upgrade until the operator's
+// Deployment has replaced its pods and a new pod leads, and returns each stretch with no running leader: from the
+// holder's pod being told to stop (its deletion timestamp set, or gone) to another holder. If the leader is replaced
+// first, the Lease can pass to the other old pod, which is replaced next: two handovers, both counted.
+func watchLeadersUntilRolledOut(t *testing.T, w *world, upgraded time.Time) []time.Duration {
+	t.Helper()
+	ctx := context.Background()
+	var gaps []time.Duration
+	var stoppedAt time.Time // when the current holder was seen told to stop; zero while it runs
+	holder := leaderIdentity(t)
+	for {
+		if time.Since(upgraded) > 4*time.Minute {
+			t.Fatalf("the operator's pods weren't replaced, with a new pod leading, within 4 minutes (holder %q)", holder)
+		}
+		now := leaderIdentity(t)
+		if now != holder && now != "" {
+			if !stoppedAt.IsZero() {
+				gaps = append(gaps, time.Since(stoppedAt).Round(100*time.Millisecond))
+				t.Logf("+%5.1fs %s took the Lease, %.1fs after the last leader was told to stop", time.Since(w.start).Seconds(), now, time.Since(stoppedAt).Seconds())
+			}
+			holder, stoppedAt = now, time.Time{}
+		}
+		podName, _, _ := strings.Cut(holder, "_")
+		var pod corev1.Pod
+		err := k8s.Get(ctx, client.ObjectKey{Namespace: "canary-system", Name: podName}, &pod)
+		running := err == nil && pod.DeletionTimestamp == nil
+		if !running && stoppedAt.IsZero() && (err == nil || apierrors.IsNotFound(err)) {
+			stoppedAt = time.Now()
+			t.Logf("+%5.1fs the leader's pod %s is stopping", time.Since(w.start).Seconds(), podName)
+		}
+		var op appsv1.Deployment
+		if err := k8s.Get(ctx, client.ObjectKey{Namespace: "canary-system", Name: "canary"}, &op); err != nil {
+			t.Fatal(err)
+		}
+		want := ptrDeref(op.Spec.Replicas)
+		rolledOut := op.Status.ObservedGeneration >= op.Generation && op.Status.UpdatedReplicas == want &&
+			op.Status.ReadyReplicas == want && op.Status.Replicas == want
+		if rolledOut && running && len(gaps) > 0 {
+			return gaps
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func ptrDeref(p *int32) int32 {
+	if p == nil {
+		return 1
+	}
+	return *p
 }
 
 // A limitation (README "Limitations"), reproduced: a namespace whose ResourceQuota leaves room for one pod beyond
